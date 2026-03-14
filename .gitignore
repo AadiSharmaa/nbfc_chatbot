@@ -1,0 +1,13 @@
+# Python Virtual Environment
+.venv/
+venv/
+__pycache__/
+
+# Environment Variables (KEEP API KEYS SECRET)
+.env
+
+# Node Modules (Frontend dependencies)
+frontend/node_modules/
+node_modules/
+dist/
+
