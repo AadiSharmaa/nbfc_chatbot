@@ -30,16 +30,16 @@ class GraphState(TypedDict):
     otp_verified: bool
 
 CRM_DATABASE = {
-    "9999999999": {
-        "name": "Rahul Sharma",
-        "city": "Mumbai",
+    "6396605002": {
+        "name": "Aadi Sharma",
+        "city": "Dehradun",
         "address": "12, Marine Drive, Mumbai",
         "salary": 85000,
         "pre_approved_limit": 500000,
         "credit_score": 780
     },
-    "8888888888": {
-        "name": "Priya Singh",
+    "9548788404": {
+        "name": "Shiavnsh Kashyap",
         "city": "Delhi",
         "address": "45, Hauz Khas, New Delhi",
         "salary": 45000,
