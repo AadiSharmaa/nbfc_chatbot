@@ -39,7 +39,7 @@ CRM_DATABASE = {
         "credit_score": 780
     },
     "9548788404": {
-        "name": "Shiavnsh Kashyap",
+        "name": "Shivansh Kashyap",
         "city": "Delhi",
         "address": "45, Hauz Khas, New Delhi",
         "salary": 45000,
@@ -81,7 +81,7 @@ def sales_agent(state: GraphState) -> GraphState:
     Internal Checklist: Amount, Tenure, Purpose, Employment Type.
     CRITICAL: Never repeat questions. Acknowledge user input and ask ONLY for the missing items. Keep answers precise.
 
-    HANDOFF RULE: Once you have collected ALL 4 items on your checklist, summarize the terms and EXPLICITLY ask the user to "please enter your 10-digit mobile number to proceed with KYC verification." Do not end the conversation without asking for their phone number."""
+    HANDOFF RULE: Once you have collected ALL 4 items on your checklist, summarize the terms and EXPLICITLY ask the user to "please enter your 10-digit mobile number to proceed with KYC verification." """
 
     response_text, updated_history = ask_gemini(
         prompt,
@@ -135,6 +135,30 @@ def verification_agent(state: GraphState) -> GraphState:
     return {**state, "response": "To verify your identity, please enter your 10-digit mobile number.",
             "active_agent": "verification"}
 
+
+def underwriting_agent(state: GraphState) -> GraphState:
+    user_input = state.get('user_input', '')
+    phone_match = re.search(r"\b\d{10}\b", user_input)
+
+    if phone_match:
+        phone_number = phone_match.group(0)
+        user_data = search_crm(phone_number)
+        if user_data:
+            score = user_data.get("credit_score", 0)
+            limit = user_data.get("pre_approved_limit", 0)
+            loan_amount = user_data.get("loan_amount", 0) # Fallback to 0 if not set
+
+            if score > 700 and limit >= loan_amount:
+                return {**state, "response": "Loan approved", "active_agent": "underwriting"}
+            elif score > 700 and limit < loan_amount:
+                return {**state, "response": "Please provide your salary slip.", "active_agent": "underwriting"}
+            else:
+                return {**state, "response": "Loan rejected", "active_agent": "underwriting"}
+
+    return {**state, "response": "Cannot underwrite without valid details.", "active_agent": "underwriting"}
+
+
+
 def master_router(state: GraphState) -> Literal["sales_node", "verification_node", "exit"]:
     user_text = state.get("user_input", "").strip()
 
@@ -163,9 +187,9 @@ def master_router(state: GraphState) -> Literal["sales_node", "verification_node
     1. CONTEXTUAL CONTINUATION: If user input directly answers the Assistant's Last Message, route to Current Active Department.
     2. SALES: If user greets, asks about loan terms, interest rates, route to SALES.
     3. VERIFICATION: Route to VERIFICATION if user asks to submit KYC or provides a phone number.
-    4. HANDOFF DETECTED: If Assistant's Last Message asked for mobile number, route to VERIFICATION immediately.
+    4. UNDERWRITING: After verification and negotiation the model need to approve or reject the loan offer.
 
-    Respond with EXACTLY ONE WORD: SALES or VERIFICATION.
+    Respond with EXACTLY ONE WORD: SALES or VERIFICATION or UNDERWRITING.
     """
     try:
         response = client.chat.completions.create(
@@ -186,14 +210,20 @@ def master_router(state: GraphState) -> Literal["sales_node", "verification_node
 workflow = StateGraph(GraphState)
 workflow.add_node("sales_node", sales_agent)
 workflow.add_node("verification_node", verification_agent)
+workflow.add_node("underwriting_node",underwriting_agent)
 
 workflow.add_conditional_edges(
     START,
     master_router,
-    {"sales_node": "sales_node", "verification_node": "verification_node", "exit": END}
+    {"sales_node": "sales_node",
+    "verification_node": "verification_node",
+    "underwriting_node": "underwriting_node",
+    "exit": END
+    }
 )
 workflow.add_edge("sales_node", END)
 workflow.add_edge("verification_node", END)
+workflow.add_edge("underwriting_node", END)
 graph_app = workflow.compile()
 
 # ---------------------------------------------------------
