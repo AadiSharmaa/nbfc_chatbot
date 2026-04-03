@@ -1,13 +1,17 @@
 import os
 import re
 import random
+import uuid
+import datetime
 from typing import TypedDict, Literal, Dict, Any
 from langgraph.graph import StateGraph, START, END
 from groq import Groq
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from fpdf import FPDF
 
 # ---------------------------------------------------------
 # 1. API Configuration & LLM Setup
@@ -32,7 +36,7 @@ class GraphState(TypedDict):
 CRM_DATABASE = {
     "6396605002": {
         "name": "Aadi Sharma",
-        "city": "Dehradun",
+        "city": "Mumbai",
         "address": "12, Marine Drive, Mumbai",
         "salary": 85000,
         "pre_approved_limit": 500000,
@@ -42,9 +46,9 @@ CRM_DATABASE = {
         "name": "Shivansh Kashyap",
         "city": "Delhi",
         "address": "45, Hauz Khas, New Delhi",
-        "salary": 45000,
-        "pre_approved_limit": 200000,
-        "credit_score": 680
+        "salary": 55000,
+        "pre_approved_limit": 250000,
+        "credit_score": 710
     }
 }
 
@@ -108,7 +112,7 @@ def verification_agent(state: GraphState) -> GraphState:
                 "Shall we proceed to the loan offer?"
             )
             return {**state, "response": response_text, "customer_details": customer_details,
-                    "otp_verified": True, "expected_otp": "", "active_agent": "master"}
+                    "otp_verified": True, "expected_otp": "", "active_agent": "underwriting"}
         else:
             return {**state, "response": "The OTP you entered does not match our records. Please try again.",
                     "active_agent": "verification"}
@@ -119,6 +123,8 @@ def verification_agent(state: GraphState) -> GraphState:
         user_details = search_crm(phone)
 
         if user_details:
+            user_details = dict(user_details)
+            user_details['phone'] = phone
             otp = str(random.randint(1000, 9999))
             response_text = (
                 f"Hi {user_details.get('name', '')}, we found your profile.\n"
@@ -136,34 +142,74 @@ def verification_agent(state: GraphState) -> GraphState:
             "active_agent": "verification"}
 
 
+def generate_sanction_letter(user_data: dict, loan_amount: int, phone: str) -> str:
+    """Generates a PDF sanction letter and returns its URL."""
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", 'B', size=16)
+
+    # Title
+    pdf.cell(200, 10, txt="SANCTION LETTER", ln=1, align='C')
+    pdf.cell(200, 10, txt="", ln=1)
+
+    pdf.set_font("Arial", size=12)
+    pdf.cell(200, 10, txt=f"Date: {datetime.date.today()}", ln=1)
+    pdf.cell(200, 10, txt=f"Name: {user_data.get('name', 'Customer')}", ln=1)
+    pdf.cell(200, 10, txt=f"Address: {user_data.get('address', 'N/A')}", ln=1)
+    pdf.cell(200, 10, txt=f"Phone: {phone}", ln=1)
+    
+    # Let's show either limit or requested loan amount. We'll show the limit if loan_amount falls back to 0.
+    amount_to_show = loan_amount if loan_amount > 0 else user_data.get("pre_approved_limit", 0)
+    pdf.cell(200, 10, txt=f"Approved Loan Amount: Rs. {amount_to_show}", ln=1)
+    pdf.cell(200, 10, txt="", ln=1)
+    
+    body_text = (
+        "Congratulations! We are pleased to inform you that your loan application "
+        "has been conditionally approved under the terms and conditions outlined in our standard "
+        "loan agreement."
+    )
+    pdf.multi_cell(0, 10, txt=body_text)
+
+    # Save PDF
+    os.makedirs("static/sanction_letters", exist_ok=True)
+    filename = f"sanction_{phone}_{uuid.uuid4().hex[:6]}.pdf"
+    filepath = os.path.join("static/sanction_letters", filename)
+    pdf.output(filepath)
+
+    return f"/static/sanction_letters/{filename}"
+
 def underwriting_agent(state: GraphState) -> GraphState:
-    user_input = state.get('user_input', '')
-    phone_match = re.search(r"\b\d{10}\b", user_input)
+    user_data = state.get('customer_details', {})
+    
+    if user_data and state.get('otp_verified'):
+        phone_number = user_data.get("phone", "Unknown")
+        score = user_data.get("credit_score", 0)
+        limit = user_data.get("pre_approved_limit", 0)
+        loan_amount = user_data.get("loan_amount", 0) # Fallback to 0 if not set
 
-    if phone_match:
-        phone_number = phone_match.group(0)
-        user_data = search_crm(phone_number)
-        if user_data:
-            score = user_data.get("credit_score", 0)
-            limit = user_data.get("pre_approved_limit", 0)
-            loan_amount = user_data.get("loan_amount", 0) # Fallback to 0 if not set
-
-            if score > 700 and limit >= loan_amount:
-                return {**state, "response": "Loan approved", "active_agent": "underwriting"}
-            elif score > 700 and limit < loan_amount:
-                return {**state, "response": "Please provide your salary slip.", "active_agent": "underwriting"}
-            else:
-                return {**state, "response": "Loan rejected", "active_agent": "underwriting"}
+        if score > 700 and limit >= loan_amount:
+            pdf_url = generate_sanction_letter(user_data, loan_amount, phone_number)
+            port = 8000 # default local port
+            download_link = f"http://localhost:{port}{pdf_url}"
+            response_msg = f"Loan approved! Your sanction letter is ready. You can download it here: {download_link}"
+            return {**state, "response": response_msg, "active_agent": "underwriting"}
+        elif score > 700 and limit < loan_amount:
+            return {**state, "response": "Please provide your salary slip.", "active_agent": "underwriting"}
+        else:
+            return {**state, "response": "Loan rejected", "active_agent": "underwriting"}
 
     return {**state, "response": "Cannot underwrite without valid details.", "active_agent": "underwriting"}
 
 
 
-def master_router(state: GraphState) -> Literal["sales_node", "verification_node", "exit"]:
+def master_router(state: GraphState) -> Literal["sales_node", "verification_node", "underwriting_node", "exit"]:
     user_text = state.get("user_input", "").strip()
 
     if user_text.lower() == "done":
         return "exit"
+
+    if state.get("otp_verified") and state.get("active_agent") == "underwriting" and user_text.lower() in ["yes", "proceed", "ok", "sure", "yeah", "yep", "do it"]:
+        return "underwriting_node"
 
     if re.search(r"\b\d{10}\b", user_text) or state.get("expected_otp"):
         return "verification_node"
@@ -199,10 +245,17 @@ def master_router(state: GraphState) -> Literal["sales_node", "verification_node
             max_tokens=10
         )
         decision = response.choices[0].message.content.strip().upper()
-        return "verification_node" if "VERIFICATION" in decision else "sales_node"
+        if "UNDERWRITING" in decision:
+            return "underwriting_node"
+        elif "VERIFICATION" in decision:
+            return "verification_node"
+        else:
+            return "sales_node"
     except Exception as e:
         print(f"Routing error: {e}")
-        return f"{active_agent}_node" if active_agent in ["sales", "verification"] else "sales_node"
+        if active_agent in ["sales", "verification", "underwriting"]:
+            return f"{active_agent}_node"
+        return "sales_node"
 
 # ---------------------------------------------------------
 # 4. Build LangGraph
@@ -230,6 +283,11 @@ graph_app = workflow.compile()
 # 5. FastAPI Integration
 # ---------------------------------------------------------
 app = FastAPI()
+
+if not os.path.exists("static/sanction_letters"):
+    os.makedirs("static/sanction_letters")
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(
     CORSMiddleware,
