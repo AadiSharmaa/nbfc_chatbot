@@ -3,11 +3,11 @@ import re
 import random
 import uuid
 import datetime
-from typing import TypedDict, Literal, Dict, Any
+from typing import TypedDict, Literal, Dict, Any, Optional
 from langgraph.graph import StateGraph, START, END
 from groq import Groq
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -32,6 +32,7 @@ class GraphState(TypedDict):
     active_agent: str
     expected_otp: str
     otp_verified: bool
+    uploaded_image: str
 
 CRM_DATABASE = {
     "6396605002": {
@@ -178,6 +179,59 @@ def generate_sanction_letter(user_data: dict, loan_amount: int, phone: str) -> s
 
     return f"/static/sanction_letters/{filename}"
 
+def verify_salary_slip(base64_img: str) -> int:
+    prompt = "Analyze this salary slip image. Extract the monthly net or gross salary. Only output the numeric value of the monthly salary without any formatting. If no salary is found, output 0."
+    try:
+        if not base64_img.startswith("data:"):
+            base64_img = f"data:image/jpeg;base64,{base64_img}"
+            
+        response = client.chat.completions.create(
+            model="llama-3.2-90b-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": base64_img,
+                            },
+                        },
+                    ],
+                }
+            ],
+            temperature=0.0
+        )
+        output_text = response.choices[0].message.content.strip()
+        match = re.search(r'\d[\d,]*', output_text)
+        if match:
+             return int(match.group().replace(',', ''))
+    except Exception as e:
+        print(f"Vision API error: {e}")
+    return 0
+
+def extract_loan_amount(chat_history: list) -> int:
+    messages = [{"role": "system", "content": "Extract the requested loan amount in rupees from the conversation. Return ONLY the numeric value (e.g., 1300000). If not found, return 0."}]
+    
+    recent_history = chat_history[-6:] if len(chat_history) > 6 else chat_history
+    for msg in recent_history:
+        messages.append({"role": msg.get("role", "user"), "content": str(msg.get("content", ""))})
+        
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.0
+        )
+        output_text = response.choices[0].message.content.strip()
+        match = re.search(r'\d[\d,]*', output_text)
+        if match:
+             return int(match.group().replace(',', ''))
+    except Exception as e:
+        print(f"Extraction error: {e}")
+    return 0
+
 def underwriting_agent(state: GraphState) -> GraphState:
     user_data = state.get('customer_details', {})
     
@@ -186,14 +240,32 @@ def underwriting_agent(state: GraphState) -> GraphState:
         score = user_data.get("credit_score", 0)
         limit = user_data.get("pre_approved_limit", 0)
         loan_amount = user_data.get("loan_amount", 0) # Fallback to 0 if not set
+        
+        if loan_amount == 0 and state.get("chat_history"):
+            loan_amount = extract_loan_amount(state.get("chat_history"))
+            user_data["loan_amount"] = loan_amount
 
         if score > 700 and limit >= loan_amount:
             pdf_url = generate_sanction_letter(user_data, loan_amount, phone_number)
-            port = 8000 # default local port
-            download_link = f"http://localhost:{port}{pdf_url}"
+            base_url = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("BASE_URL", "http://localhost:8000"))
+            download_link = f"{base_url}{pdf_url}"
             response_msg = f"Loan approved! Your sanction letter is ready. You can download it here: {download_link}"
             return {**state, "response": response_msg, "active_agent": "underwriting"}
         elif score > 700 and limit < loan_amount:
+            if state.get("uploaded_image"):
+                salary_found = verify_salary_slip(state["uploaded_image"])
+                if salary_found >= (loan_amount / 20):  # Assuming 20 months tenure tolerance or something similar, simple rule
+                    # Approving dynamically based on slip
+                    # Set limit to cover loan amount so it passes next time, or just approve inline
+                    user_data["pre_approved_limit"] = loan_amount
+                    pdf_url = generate_sanction_letter(user_data, loan_amount, phone_number)
+                    base_url = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("BASE_URL", "http://localhost:8000"))
+                    download_link = f"{base_url}{pdf_url}"
+                    response_msg = f"Salary slip verified (Amount: Rs. {salary_found})! Loan conditionally approved based on verified salary. Your sanction letter is ready. You can download it here: {download_link}"
+                    return {**state, "response": response_msg, "active_agent": "underwriting", "uploaded_image": "", "customer_details": user_data}
+                else:
+                    return {**state, "response": f"Salary slip evaluated, but extracted salary (Rs. {salary_found}) is insufficient for the requested loan amount.", "active_agent": "underwriting", "uploaded_image": ""}
+            
             return {**state, "response": "Please provide your salary slip.", "active_agent": "underwriting"}
         else:
             return {**state, "response": "Loan rejected", "active_agent": "underwriting"}
@@ -300,6 +372,25 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     user_input: str
     state: Dict[str, Any]
+    image: Optional[str] = None
+
+@app.post("/transcribe")
+async def transcribe_endpoint(audio: UploadFile = File(...)):
+    try:
+        content = await audio.read()
+        filename = audio.filename if audio.filename else "audio.webm"
+        # We ensure it has a recognized audio extension for whisper
+        if not filename.endswith(('.mp3', '.mp4', '.mpeg', '.mpga', '.m4a', '.wav', '.webm')):
+            filename = "audio.webm"
+            
+        transcription = client.audio.transcriptions.create(
+          file=(filename, content),
+          model="whisper-large-v3-turbo",
+        )
+        return {"text": transcription.text}
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        return {"error": str(e), "text": ""}
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
@@ -316,6 +407,9 @@ async def chat_endpoint(req: ChatRequest):
         }
     
     current_state["user_input"] = req.user_input
+    if req.image:
+        current_state["uploaded_image"] = req.image
+        
     result = graph_app.invoke(current_state)
     
     return {

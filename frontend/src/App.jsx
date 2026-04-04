@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { RefreshCw, Send, Mic, HelpCircle } from 'lucide-react';
+import { RefreshCw, Send, Mic, HelpCircle, Paperclip, X, Square } from 'lucide-react';
 import './App.css';
 
 function App() {
@@ -8,8 +8,14 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [hasStartedChat, setHasStartedChat] = useState(false);
   const [graphState, setGraphState] = useState(null);
-  
+  const [selectedImage, setSelectedImage] = useState(null);
+  const [imagePreview, setImagePreview] = useState(null);
+  const [isRecording, setIsRecording] = useState(false);
+
   const messagesEndRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -22,25 +28,114 @@ function App() {
     { icon: '📚', text: 'Education loan assistance' }
   ];
 
+  const handleImageSelect = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setSelectedImage(reader.result);
+        setImagePreview(URL.createObjectURL(file));
+      };
+      reader.readAsDataURL(file);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const clearImage = () => {
+    setSelectedImage(null);
+    setImagePreview(null);
+  };
+
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) audioChunksRef.current.push(event.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        stream.getTracks().forEach(track => track.stop());
+        await processAudio(audioBlob);
+      };
+
+      mediaRecorder.start();
+      setIsRecording(true);
+    } catch (err) {
+      console.error("Microphone access denied:", err);
+      alert("Microphone access is required for voice input.");
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+      setIsRecording(false);
+    }
+  };
+
+  const toggleRecording = () => {
+    if (isRecording) {
+      stopRecording();
+    } else {
+      startRecording();
+    }
+  };
+
+  const processAudio = async (audioBlob) => {
+    setIsLoading(true);
+    try {
+      const formData = new FormData();
+      formData.append("audio", audioBlob, "recording.webm");
+
+      const response = await fetch('https://nbfc-ai-backend.onrender.com/transcribe', {
+      // const response = await fetch('http://localhost:8000/transcribe', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await response.json();
+      if (data.text && data.text.trim()) {
+        handleSend(data.text);
+      } else {
+        setIsLoading(false);
+      }
+    } catch (error) {
+      console.error("Transcription error:", error);
+      setIsLoading(false);
+    }
+  };
+
   const handleSend = async (text) => {
     const userText = text || input;
-    if (!userText.trim()) return;
+    if (!userText.trim() && !selectedImage) return;
 
     setHasStartedChat(true);
     
-    const userMessage = { role: 'user', content: userText };
+    const contentToDisplay = userText + (selectedImage ? "\n[Attachment: Image]" : "");
+    const userMessage = { role: 'user', content: contentToDisplay };
     setMessages(prev => [...prev, userMessage]);
+    
+    const textToSend = userText.trim() || (selectedImage ? "Here is my attached document." : "");
+    const imageToSend = selectedImage;
+    
     setInput('');
+    clearImage();
     setIsLoading(true);
 
     try {
-      const response = await fetch('https://nbfc-ai-backend.onrender.com/chat', {  
-      // const response = await fetch('http://localhost:8000/chat' , {
+      // const response = await fetch('https://nbfc-ai-backend.onrender.com/chat', {  
+      const response = await fetch('http://localhost:8000/chat' , {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          user_input: userText,
-          state: graphState || {} 
+          user_input: textToSend,
+          state: graphState || {},
+          image: imageToSend
         })
       });
 
@@ -64,6 +159,19 @@ function App() {
     setHasStartedChat(false);
     setGraphState(null);
     setInput('');
+    clearImage();
+  };
+
+  const renderMessageContent = (content) => {
+    if (typeof content !== 'string') return content;
+    const urlRegex = /(https?:\/\/[^\s]+)/g;
+    const parts = content.split(urlRegex);
+    return parts.map((part, i) => {
+      if (part.match(urlRegex)) {
+        return <a key={i} href={part} target="_blank" rel="noopener noreferrer" style={{ color: '#007bff', textDecoration: 'underline', wordBreak: 'break-all' }}>{part}</a>;
+      }
+      return part;
+    });
   };
 
   return (
@@ -108,7 +216,7 @@ function App() {
             {messages.map((msg, index) => (
               <div key={index} className={`message-wrapper ${msg.role}`}>
                 <div className="message-bubble">
-                  {msg.content}
+                  {renderMessageContent(msg.content)}
                 </div>
               </div>
             ))}
@@ -125,8 +233,26 @@ function App() {
       </main>
 
       <div className="input-container">
+        {imagePreview && (
+          <div className="image-preview-container">
+            <img src={imagePreview} alt="Selected document" className="image-preview" />
+            <button className="clear-image-btn" onClick={clearImage} title="Remove attachment">
+              <X size={14} />
+            </button>
+          </div>
+        )}
         <div className="input-box-wrapper">
           <div className="input-field-wrapper">
+            <input 
+              type="file" 
+              accept="image/*" 
+              ref={fileInputRef} 
+              onChange={handleImageSelect} 
+              style={{ display: 'none' }} 
+            />
+            <button className="attach-btn" onClick={() => fileInputRef.current?.click()} title="Attach salary slip">
+              <Paperclip size={20} />
+            </button>
             <input
               type="text"
               className="chat-input"
@@ -136,15 +262,19 @@ function App() {
               onKeyDown={(e) => e.key === 'Enter' && handleSend()}
             />
             <button 
-              className={`send-btn ${input.trim() ? 'active' : ''}`}
+              className={`send-btn ${(input.trim() || selectedImage) ? 'active' : ''}`}
               onClick={() => handleSend()}
-              disabled={isLoading || !input.trim()}
+              disabled={isLoading || (!input.trim() && !selectedImage)}
             >
               <Send size={18} />
             </button>
           </div>
-          <button className="mic-btn">
-            <Mic size={20} />
+          <button 
+            className={`mic-btn ${isRecording ? 'recording' : ''}`}
+            onClick={toggleRecording}
+            title={isRecording ? "Stop recording" : "Voice input"}
+          >
+            {isRecording ? <Square size={20} fill="#ef4444" color="#ef4444" /> : <Mic size={20} />}
           </button>
         </div>
         <div className="footer-text">
