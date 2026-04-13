@@ -5,19 +5,21 @@ import uuid
 import datetime
 from typing import TypedDict, Literal, Dict, Any, Optional
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 from groq import Groq
-from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File
+from dotenv import load_dotenv, find_dotenv
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from fpdf import FPDF
+from memory import init_memory_db, get_conversation_summary, save_conversation_summary, delete_conversation_memory, summarize_conversation
 
 # ---------------------------------------------------------
 # 1. API Configuration & LLM Setup
 # ---------------------------------------------------------
-load_dotenv()
-API_KEY = os.getenv('groq_api_key')
+load_dotenv(find_dotenv())
+API_KEY = os.getenv('groq_api_key') or os.getenv('GROQ_API_KEY')
 client = Groq(api_key=API_KEY)
 model_name = "llama-3.3-70b-versatile"
 
@@ -33,6 +35,8 @@ class GraphState(TypedDict):
     expected_otp: str
     otp_verified: bool
     uploaded_image: str
+    session_id: str
+    memory_context: str
 
 CRM_DATABASE = {
     "6396605002": {
@@ -49,7 +53,7 @@ CRM_DATABASE = {
         "address": "45, Hauz Khas, New Delhi",
         "salary": 55000,
         "pre_approved_limit": 250000,
-        "credit_score": 710
+        "credit_score": 680
     }
 }
 
@@ -82,11 +86,21 @@ def ask_gemini(system_prompt, user_input, chat_history):
         return f"An error occurred: {e}", chat_history
 
 def sales_agent(state: GraphState) -> GraphState:
-    prompt = """You are a Sales Agent for an NBFC negotiating loan terms.
-    Internal Checklist: Amount, Tenure, Purpose, Employment Type.
-    CRITICAL: Never repeat questions. Acknowledge user input and ask ONLY for the missing items. Keep answers precise.
+    memory_ctx = state.get("memory_context", "")
+    context_block = ""
+    if memory_ctx:
+        context_block = f"\n\nCONTEXT FROM PREVIOUS INTERACTIONS WITH THIS CUSTOMER:\n{memory_ctx}\nUse this context to personalize the conversation. Reference past interactions naturally (e.g., 'Welcome back!' or 'Last time you were looking at...'). Do NOT repeat the summary verbatim.\n"
 
-    HANDOFF RULE: Once you have collected ALL 4 items on your checklist, summarize the terms and EXPLICITLY ask the user to "please enter your 10-digit mobile number to proceed with KYC verification." """
+    prompt = f"""You are a Sales Agent for an NBFC negotiating loan terms.
+    Internal Checklist: Amount, Tenure, Purpose, Employment Type.
+    {context_block}
+    CONVERSATION GUIDELINES:
+    1. RELEVANT QUESTIONS: If the user asks general questions about loans, interest rates, or banking, answer them openly and then gently guide the conversation back to collecting the missing checklist items.
+    2. IRRELEVANT QUESTIONS: If the user asks about unrelated topics (e.g., cars, food, general chat), politely state that this is outside your expertise and steer them back to the loan application process.
+    3. STRICT COMPLIANCE RULE: You MUST validate the 'Purpose'. Acceptable purposes are: Business Expansion, Medical Emergency, Education, Home Renovation, or Vehicle Purchase. If the user states ANY other purpose (like food, daily expenses, gambling, etc.), you MUST politely inform them that NBFC policy does not permit lending for this purpose. DO NOT ask for any more checklist items! Reject the loan immediately.
+    4. CRITICAL: Never repeat questions. Acknowledge user input and ask ONLY for the missing items. Keep answers precise.
+
+    HANDOFF RULE: Once you have collected ALL 4 items on your checklist AND the purpose is acceptable, summarize the terms and EXPLICITLY ask the user to \"please enter your 10-digit mobile number to proceed with KYC verification.\" """
 
     response_text, updated_history = ask_gemini(
         prompt,
@@ -127,14 +141,25 @@ def verification_agent(state: GraphState) -> GraphState:
             user_details = dict(user_details)
             user_details['phone'] = phone
             otp = str(random.randint(1000, 9999))
+
+            # Load long-term memory for returning customers
+            past_memory = get_conversation_summary(phone)
+            memory_context = ""
+            if past_memory:
+                memory_context = past_memory["summary"]
+                greeting_extra = f" Welcome back! This is interaction #{past_memory['interaction_count'] + 1}."
+            else:
+                greeting_extra = ""
+
             response_text = (
-                f"Hi {user_details.get('name', '')}, we found your profile.\n"
+                f"Hi {user_details.get('name', '')}, we found your profile.{greeting_extra}\n"
                 f"For KYC verification, a 4-digit OTP has been sent to **{phone}**.\n"
                 f"*(Demo OTP: {otp})*\n\n"
                 "Please type the OTP here to complete verification."
             )
             return {**state, "response": response_text, "customer_details": user_details,
-                    "expected_otp": otp, "otp_verified": False, "active_agent": "verification"}
+                    "expected_otp": otp, "otp_verified": False, "active_agent": "verification",
+                    "memory_context": memory_context}
         else:
             return {**state, "response": "Verification Failed. This number is not in our records.",
                     "active_agent": "verification"}
@@ -162,6 +187,8 @@ def generate_sanction_letter(user_data: dict, loan_amount: int, phone: str) -> s
     # Let's show either limit or requested loan amount. We'll show the limit if loan_amount falls back to 0.
     amount_to_show = loan_amount if loan_amount > 0 else user_data.get("pre_approved_limit", 0)
     pdf.cell(200, 10, txt=f"Approved Loan Amount: Rs. {amount_to_show}", ln=1)
+    pdf.cell(200, 10, txt=f"Interest Rate: 12% p.a.", ln=1)
+    pdf.cell(200, 10, txt=f"Processing Fees: 2% of loan amount + GST", ln=1)
     pdf.cell(200, 10, txt="", ln=1)
     
     body_text = (
@@ -212,9 +239,9 @@ def verify_salary_slip(base64_img: str) -> int:
     return 0
 
 def extract_loan_amount(chat_history: list) -> int:
-    messages = [{"role": "system", "content": "Extract the requested loan amount in rupees from the conversation. Return ONLY the numeric value (e.g., 1300000). If not found, return 0."}]
+    messages = [{"role": "system", "content": "Extract the requested loan amount in rupees from the conversation. Return ONLY the numeric value in digits (e.g., 1300000). Convert terms like 'lakh', 'k', 'thousand' to numbers correctly."}]
     
-    recent_history = chat_history[-6:] if len(chat_history) > 6 else chat_history
+    recent_history = chat_history[-20:] if len(chat_history) > 20 else chat_history
     for msg in recent_history:
         messages.append({"role": msg.get("role", "user"), "content": str(msg.get("content", ""))})
         
@@ -264,11 +291,15 @@ def underwriting_agent(state: GraphState) -> GraphState:
                     response_msg = f"Salary slip verified (Amount: Rs. {salary_found})! Loan conditionally approved based on verified salary. Your sanction letter is ready. You can download it here: {download_link}"
                     return {**state, "response": response_msg, "active_agent": "underwriting", "uploaded_image": "", "customer_details": user_data}
                 else:
-                    return {**state, "response": f"Salary slip evaluated, but extracted salary (Rs. {salary_found}) is insufficient for the requested loan amount.", "active_agent": "underwriting", "uploaded_image": ""}
+                    return {**state, "response": f"Loan rejected: Your verified salary (Rs. {salary_found}) is insufficient to support the requested loan amount of Rs. {loan_amount}.", "active_agent": "underwriting", "uploaded_image": ""}
             
             return {**state, "response": "Please provide your salary slip.", "active_agent": "underwriting"}
         else:
-            return {**state, "response": "Loan rejected", "active_agent": "underwriting"}
+            reasons = []
+            if score <= 700:
+                reasons.append(f"Credit score ({score}) is below our minimum requirement of 700")
+            reason_str = ", ".join(reasons) if reasons else "Does not meet our internal lending policies"
+            return {**state, "response": f"Loan rejected: {reason_str}.", "active_agent": "underwriting"}
 
     return {**state, "response": "Cannot underwrite without valid details.", "active_agent": "underwriting"}
 
@@ -280,8 +311,10 @@ def master_router(state: GraphState) -> Literal["sales_node", "verification_node
     if user_text.lower() == "done":
         return "exit"
 
-    if state.get("otp_verified") and state.get("active_agent") == "underwriting" and user_text.lower() in ["yes", "proceed", "ok", "sure", "yeah", "yep", "do it"]:
-        return "underwriting_node"
+    if state.get("otp_verified") and state.get("active_agent") == "underwriting":
+        positive_affirmations = ["yes", "proceed", "ok", "sure", "yeah", "yep", "do it"]
+        if any(word in user_text.lower() for word in positive_affirmations):
+            return "underwriting_node"
 
     if re.search(r"\b\d{10}\b", user_text) or state.get("expected_otp"):
         return "verification_node"
@@ -296,10 +329,17 @@ def master_router(state: GraphState) -> Literal["sales_node", "verification_node
                 last_assistant_msg = msg.get("content")
                 break
 
+    memory_ctx = state.get("memory_context", "")
+    memory_block = ""
+    if memory_ctx:
+        memory_block = f"\nPREVIOUS INTERACTION NOTES: {memory_ctx}\n"
+
     router_prompt = f"""You are a Master Routing Agent for an NBFC chatbot.
     Current Active Department: {active_agent.upper()}
     Assistant's Last Message: "{last_assistant_msg}"
     User's Latest Input: "{user_text}"
+    {memory_block}
+    COMPLIANCE MANDATE: Under no circumstances will you factor in the user's gender, caste, religion, or background when discussing loan terms, routing intents, or assessing risk.
 
     ROUTING RULES:
     1. CONTEXTUAL CONTINUATION: If user input directly answers the Assistant's Last Message, route to Current Active Department.
@@ -349,12 +389,17 @@ workflow.add_conditional_edges(
 workflow.add_edge("sales_node", END)
 workflow.add_edge("verification_node", END)
 workflow.add_edge("underwriting_node", END)
-graph_app = workflow.compile()
+
+checkpoint_memory = MemorySaver()
+graph_app = workflow.compile(checkpointer=checkpoint_memory)
 
 # ---------------------------------------------------------
 # 5. FastAPI Integration
 # ---------------------------------------------------------
 app = FastAPI()
+
+# Initialize the long-term memory database on startup
+init_memory_db()
 
 if not os.path.exists("static/sanction_letters"):
     os.makedirs("static/sanction_letters")
@@ -373,6 +418,15 @@ class ChatRequest(BaseModel):
     user_input: str
     state: Dict[str, Any]
     image: Optional[str] = None
+    session_id: Optional[str] = None
+
+class EndSessionRequest(BaseModel):
+    chat_history: list
+    customer_details: Dict[str, Any]
+    phone_number: Optional[str] = None
+
+class ForgetMeRequest(BaseModel):
+    phone_number: str
 
 @app.post("/transcribe")
 async def transcribe_endpoint(audio: UploadFile = File(...)):
@@ -403,19 +457,57 @@ async def chat_endpoint(req: ChatRequest):
             "user_input": "",
             "active_agent": "master",
             "expected_otp": "",
-            "otp_verified": False
+            "otp_verified": False,
+            "session_id": "",
+            "memory_context": ""
         }
     
+    session_id = req.session_id or current_state.get("session_id") or str(uuid.uuid4())
     current_state["user_input"] = req.user_input
+    current_state["session_id"] = session_id
     if req.image:
         current_state["uploaded_image"] = req.image
-        
-    result = graph_app.invoke(current_state)
+
+    # Invoke with thread_id for MemorySaver checkpointing
+    config = {"configurable": {"thread_id": session_id}}
+    result = graph_app.invoke(current_state, config=config)
     
     return {
         "response": result["response"],
         "state": result
     }
+
+
+@app.post("/end-session")
+async def end_session_endpoint(request: Request):
+    """Summarize the conversation and save to long-term memory.
+    Accepts both application/json (from fetch) and text/plain (from sendBeacon).
+    """
+    try:
+        body = await request.json()
+        phone_number = body.get("phone_number")
+        chat_history = body.get("chat_history", [])
+        customer_details = body.get("customer_details", {})
+
+        if not phone_number:
+            return {"status": "skipped", "reason": "No phone number provided"}
+
+        summary = summarize_conversation(client, chat_history, customer_details)
+        save_conversation_summary(phone_number, summary)
+        return {"status": "saved", "summary": summary}
+    except Exception as e:
+        print(f"End-session error: {e}")
+        return {"status": "error", "reason": str(e)}
+
+
+@app.post("/forget-me")
+async def forget_me_endpoint(req: ForgetMeRequest):
+    """Delete all stored conversation memory for a phone number."""
+    deleted = delete_conversation_memory(req.phone_number)
+    if deleted:
+        return {"status": "deleted", "message": f"All conversation memory for {req.phone_number} has been permanently deleted."}
+    else:
+        return {"status": "not_found", "message": f"No stored memory found for {req.phone_number}."}
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,6 +1,10 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { RefreshCw, Send, Mic, HelpCircle, Paperclip, X, Square } from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { RefreshCw, Send, Mic, HelpCircle, Paperclip, X, Square, Trash2 } from 'lucide-react';
 import './App.css';
+
+// API base URL — switch between local and deployed
+const API_BASE = 'http://localhost:8000';
+// const API_BASE = 'https://nbfc-ai-backend.onrender.com';
 
 function App() {
   const [messages, setMessages] = useState([]);
@@ -11,15 +15,51 @@ function App() {
   const [selectedImage, setSelectedImage] = useState(null);
   const [imagePreview, setImagePreview] = useState(null);
   const [isRecording, setIsRecording] = useState(false);
+  const [showForgetModal, setShowForgetModal] = useState(false);
+  const [forgetPhone, setForgetPhone] = useState('');
+  const [forgetStatus, setForgetStatus] = useState(null);
+
+  // Session ID — persists across page refreshes within the same tab
+  const [sessionId] = useState(() => {
+    let id = sessionStorage.getItem('brisk_session_id');
+    if (!id) {
+      id = crypto.randomUUID();
+      sessionStorage.setItem('brisk_session_id', id);
+    }
+    return id;
+  });
 
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
+  const graphStateRef = useRef(graphState);
+
+  // Keep ref in sync for beforeunload handler
+  useEffect(() => {
+    graphStateRef.current = graphState;
+  }, [graphState]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Save memory when tab/browser closes
+  useEffect(() => {
+    const handleUnload = () => {
+      const state = graphStateRef.current;
+      if (state?.customer_details?.phone) {
+        const payload = JSON.stringify({
+          chat_history: state.chat_history || [],
+          customer_details: state.customer_details || {},
+          phone_number: state.customer_details.phone
+        });
+        navigator.sendBeacon(`${API_BASE}/end-session`, payload);
+      }
+    };
+    window.addEventListener('beforeunload', handleUnload);
+    return () => window.removeEventListener('beforeunload', handleUnload);
+  }, []);
 
   const promptCards = [
     { icon: '💼', text: 'I need a loan for my business' },
@@ -92,8 +132,7 @@ function App() {
       const formData = new FormData();
       formData.append("audio", audioBlob, "recording.webm");
 
-      const response = await fetch('https://nbfc-ai-backend.onrender.com/transcribe', {
-      // const response = await fetch('http://localhost:8000/transcribe', {
+      const response = await fetch(`${API_BASE}/transcribe`, {
         method: 'POST',
         body: formData,
       });
@@ -115,51 +154,88 @@ function App() {
     if (!userText.trim() && !selectedImage) return;
 
     setHasStartedChat(true);
-    
+
     const contentToDisplay = userText + (selectedImage ? "\n[Attachment: Image]" : "");
     const userMessage = { role: 'user', content: contentToDisplay };
     setMessages(prev => [...prev, userMessage]);
-    
+
     const textToSend = userText.trim() || (selectedImage ? "Here is my attached document." : "");
     const imageToSend = selectedImage;
-    
+
     setInput('');
     clearImage();
     setIsLoading(true);
 
     try {
-      const response = await fetch('https://nbfc-ai-backend.onrender.com/chat', {  
-      // const response = await fetch('http://localhost:8000/chat' , {
+      const response = await fetch(`${API_BASE}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user_input: textToSend,
           state: graphState || {},
-          image: imageToSend
+          image: imageToSend,
+          session_id: sessionId
         })
       });
 
       const data = await response.json();
       setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
       setGraphState(data.state);
-      
+
     } catch (error) {
       console.error("Backend connection error:", error);
-      setMessages(prev => [...prev, { 
-        role: 'assistant', 
-        content: "Sorry, I'm having trouble connecting to the server. Please make sure the Python backend is running." 
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content: "Sorry, I'm having trouble connecting to the server. Please make sure the Python backend is running."
       }]);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const resetChat = () => {
+  const resetChat = async () => {
+    // Save conversation memory before clearing
+    if (graphState?.customer_details?.phone) {
+      try {
+        await fetch(`${API_BASE}/end-session`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_history: graphState.chat_history || [],
+            customer_details: graphState.customer_details || {},
+            phone_number: graphState.customer_details.phone
+          })
+        });
+      } catch (err) {
+        console.error('Failed to save session memory:', err);
+      }
+    }
     setMessages([]);
     setHasStartedChat(false);
     setGraphState(null);
     setInput('');
     clearImage();
+    // Generate a new session ID for the next conversation
+    const newId = crypto.randomUUID();
+    sessionStorage.setItem('brisk_session_id', newId);
+  };
+
+  const handleForgetMe = async () => {
+    if (!forgetPhone.trim() || forgetPhone.trim().length !== 10) {
+      setForgetStatus({ type: 'error', message: 'Please enter a valid 10-digit phone number.' });
+      return;
+    }
+    try {
+      const response = await fetch(`${API_BASE}/forget-me`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone_number: forgetPhone.trim() })
+      });
+      const data = await response.json();
+      setForgetStatus({ type: data.status === 'deleted' ? 'success' : 'info', message: data.message });
+    } catch (err) {
+      setForgetStatus({ type: 'error', message: 'Failed to connect to server.' });
+    }
   };
 
   const renderMessageContent = (content) => {
@@ -181,27 +257,32 @@ function App() {
           <div className="logo-icon">💬</div>
           BriskAI
         </div>
-        <button className="icon-btn" onClick={resetChat} title="Reset Chat">
-          <RefreshCw size={20} />
-        </button>
+        <div className="header-actions">
+          <button className="icon-btn forget-btn" onClick={() => { setShowForgetModal(true); setForgetStatus(null); setForgetPhone(''); }} title="Forget Me">
+            <Trash2 size={18} />
+          </button>
+          <button className="icon-btn" onClick={resetChat} title="Reset Chat">
+            <RefreshCw size={20} />
+          </button>
+        </div>
       </header>
 
       <main className="main-content">
         {!hasStartedChat ? (
           <div className="empty-state">
             <div className="glowing-orb"></div>
-            
+
             <h1 className="greeting">Good evening, Aadi</h1>
             <h2 className="sub-greeting">What can I help you with?</h2>
-            
+
             <p className="instruction-text">
               Choose a prompt below or write your own to start chatting with BriskAI
             </p>
 
             <div className="prompts-grid">
               {promptCards.map((card, index) => (
-                <button 
-                  key={index} 
+                <button
+                  key={index}
                   className="prompt-card"
                   onClick={() => handleSend(card.text)}
                 >
@@ -243,12 +324,12 @@ function App() {
         )}
         <div className="input-box-wrapper">
           <div className="input-field-wrapper">
-            <input 
-              type="file" 
-              accept="image/*" 
-              ref={fileInputRef} 
-              onChange={handleImageSelect} 
-              style={{ display: 'none' }} 
+            <input
+              type="file"
+              accept="image/*"
+              ref={fileInputRef}
+              onChange={handleImageSelect}
+              style={{ display: 'none' }}
             />
             <button className="attach-btn" onClick={() => fileInputRef.current?.click()} title="Attach salary slip">
               <Paperclip size={20} />
@@ -261,7 +342,7 @@ function App() {
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSend()}
             />
-            <button 
+            <button
               className={`send-btn ${(input.trim() || selectedImage) ? 'active' : ''}`}
               onClick={() => handleSend()}
               disabled={isLoading || (!input.trim() && !selectedImage)}
@@ -269,7 +350,7 @@ function App() {
               <Send size={18} />
             </button>
           </div>
-          <button 
+          <button
             className={`mic-btn ${isRecording ? 'recording' : ''}`}
             onClick={toggleRecording}
             title={isRecording ? "Stop recording" : "Voice input"}
@@ -285,6 +366,41 @@ function App() {
       <button className="help-fab">
         <HelpCircle size={24} />
       </button>
+
+      {/* Forget Me Modal */}
+      {showForgetModal && (
+        <div className="modal-overlay" onClick={() => setShowForgetModal(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3><Trash2 size={20} /> Forget Me</h3>
+              <button className="modal-close" onClick={() => setShowForgetModal(false)}>
+                <X size={18} />
+              </button>
+            </div>
+            <p className="modal-description">
+              This will permanently delete all stored conversation memory associated with your phone number. This action cannot be undone.
+            </p>
+            <div className="modal-input-group">
+              <input
+                type="tel"
+                className="modal-input"
+                placeholder="Enter your 10-digit phone number"
+                value={forgetPhone}
+                onChange={(e) => setForgetPhone(e.target.value.replace(/\D/g, '').slice(0, 10))}
+                maxLength={10}
+              />
+              <button className="modal-delete-btn" onClick={handleForgetMe}>
+                Delete My Data
+              </button>
+            </div>
+            {forgetStatus && (
+              <div className={`modal-status ${forgetStatus.type}`}>
+                {forgetStatus.message}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
