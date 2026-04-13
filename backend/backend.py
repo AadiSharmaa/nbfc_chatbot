@@ -238,8 +238,55 @@ def verify_salary_slip(base64_img: str) -> int:
         print(f"Vision API error: {e}")
     return 0
 
+def extract_loan_amount_regex(chat_history: list) -> int:
+    """Try to extract loan amount from chat text using regex patterns for Indian currency expressions."""
+    # Combine all user messages into one text block
+    user_text = " ".join(
+        str(msg.get("content", "")) for msg in chat_history if msg.get("role") == "user"
+    ).lower()
+    
+    # Also check assistant summaries (they often restate the amount clearly)
+    all_text = " ".join(
+        str(msg.get("content", "")) for msg in chat_history
+    ).lower()
+
+    # Pattern: "10 lakh", "10 lakhs", "10 lac", "10lakh", "₹10 lakh"
+    lakh_match = re.search(r'[\₹rs\.?\s]*(\d+(?:\.\d+)?)\s*(?:lakh|lakhs|lac|lacs)\b', all_text)
+    if lakh_match:
+        return int(float(lakh_match.group(1)) * 100000)
+
+    # Pattern: "10,00,000" or "1000000" (Indian notation for lakhs)
+    indian_match = re.search(r'[\₹rs\.?\s]*(\d{1,2},\d{2},\d{3})', all_text)
+    if indian_match:
+        return int(indian_match.group(1).replace(',', ''))
+
+    # Pattern: "500k", "500K"
+    k_match = re.search(r'[\₹rs\.?\s]*(\d+(?:\.\d+)?)\s*k\b', all_text)
+    if k_match:
+        return int(float(k_match.group(1)) * 1000)
+
+    # Pattern: "5 crore", "5 crores", "5 cr"
+    crore_match = re.search(r'[\₹rs\.?\s]*(\d+(?:\.\d+)?)\s*(?:crore|crores|cr)\b', all_text)
+    if crore_match:
+        return int(float(crore_match.group(1)) * 10000000)
+
+    # Pattern: plain large number like "1000000" or "500000"
+    plain_match = re.search(r'[\₹rs\.?\s]*(\d{5,})', all_text)
+    if plain_match:
+        return int(plain_match.group(1))
+
+    return 0
+
 def extract_loan_amount(chat_history: list) -> int:
-    messages = [{"role": "system", "content": "Extract the requested loan amount in rupees from the conversation. Return ONLY the numeric value in digits (e.g., 1300000). Convert terms like 'lakh', 'k', 'thousand' to numbers correctly."}]
+    """Extract the requested loan amount. Uses regex first (reliable), falls back to LLM."""
+    # --- Step 1: Try regex-based extraction (fast and reliable) ---
+    amount = extract_loan_amount_regex(chat_history)
+    if amount > 0:
+        print(f"[Loan Extraction] Regex found amount: {amount}")
+        return amount
+
+    # --- Step 2: Fallback to LLM extraction ---
+    messages = [{"role": "system", "content": "Extract the requested loan amount in rupees from the conversation. Return ONLY the numeric value in digits (e.g., 1300000). Convert terms like 'lakh', 'k', 'thousand' to numbers correctly. If no loan amount is mentioned, return 0."}]
     
     recent_history = chat_history[-20:] if len(chat_history) > 20 else chat_history
     for msg in recent_history:
@@ -252,12 +299,21 @@ def extract_loan_amount(chat_history: list) -> int:
             temperature=0.0
         )
         output_text = response.choices[0].message.content.strip()
+        print(f"[Loan Extraction] LLM returned: {output_text}")
         match = re.search(r'\d[\d,]*', output_text)
         if match:
              return int(match.group().replace(',', ''))
     except Exception as e:
         print(f"Extraction error: {e}")
     return 0
+
+def calculate_emi(principal: int, annual_rate: float = 12.0, tenure_months: int = 60) -> float:
+    """Calculate monthly EMI using the standard reducing balance formula."""
+    monthly_rate = annual_rate / (12 * 100)
+    if monthly_rate == 0:
+        return principal / tenure_months
+    emi = principal * monthly_rate * ((1 + monthly_rate) ** tenure_months) / (((1 + monthly_rate) ** tenure_months) - 1)
+    return round(emi, 2)
 
 def underwriting_agent(state: GraphState) -> GraphState:
     user_data = state.get('customer_details', {})
@@ -266,40 +322,77 @@ def underwriting_agent(state: GraphState) -> GraphState:
         phone_number = user_data.get("phone", "Unknown")
         score = user_data.get("credit_score", 0)
         limit = user_data.get("pre_approved_limit", 0)
-        loan_amount = user_data.get("loan_amount", 0) # Fallback to 0 if not set
+        salary = user_data.get("salary", 0)
+        loan_amount = user_data.get("loan_amount", 0)
         
         if loan_amount == 0 and state.get("chat_history"):
             loan_amount = extract_loan_amount(state.get("chat_history"))
             user_data["loan_amount"] = loan_amount
 
-        if score > 700 and limit >= loan_amount:
+        # --- REJECTION CONDITIONS (check first) ---
+        # Reject if credit score < 700
+        if score < 700:
+            return {**state, "response": f"Loan rejected: Your credit score ({score}) is below our minimum requirement of 700.",
+                    "active_agent": "underwriting", "customer_details": user_data}
+
+        # Reject if loan amount > 2× pre-approved limit
+        if loan_amount > 2 * limit:
+            return {**state, "response": (
+                f"Loan rejected: The requested amount of ₹{loan_amount:,} exceeds the maximum eligible limit of ₹{2 * limit:,} "
+                f"(2× your pre-approved limit of ₹{limit:,}). Please apply for a lower amount."
+            ), "active_agent": "underwriting", "customer_details": user_data}
+
+        # --- TIER 1: Instant Approval (loan ≤ pre-approved limit) ---
+        if loan_amount <= limit:
             pdf_url = generate_sanction_letter(user_data, loan_amount, phone_number)
             base_url = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("BASE_URL", "http://localhost:8000"))
             download_link = f"{base_url}{pdf_url}"
-            response_msg = f"Loan approved! Your sanction letter is ready. You can download it here: {download_link}"
-            return {**state, "response": response_msg, "active_agent": "underwriting"}
-        elif score > 700 and limit < loan_amount:
+            emi = calculate_emi(loan_amount)
+            response_msg = (
+                f"✅ **Loan Approved Instantly!**\n\n"
+                f"Your requested amount of ₹{loan_amount:,} is within your pre-approved limit of ₹{limit:,}.\n"
+                f"**Estimated EMI:** ₹{emi:,.2f}/month (at 12% p.a. for 60 months)\n\n"
+                f"Your sanction letter is ready. You can download it here: {download_link}"
+            )
+            return {**state, "response": response_msg, "active_agent": "underwriting", "customer_details": user_data}
+
+        # --- TIER 2: Conditional Approval (limit < loan ≤ 2× limit) — needs salary slip ---
+        if loan_amount <= 2 * limit:
             if state.get("uploaded_image"):
                 salary_found = verify_salary_slip(state["uploaded_image"])
-                if salary_found >= (loan_amount / 20):  # Assuming 20 months tenure tolerance or something similar, simple rule
-                    # Approving dynamically based on slip
-                    # Set limit to cover loan amount so it passes next time, or just approve inline
+                emi = calculate_emi(loan_amount)
+                max_allowed_emi = salary_found * 0.50  # EMI must be ≤ 50% of salary
+
+                if emi <= max_allowed_emi:
                     user_data["pre_approved_limit"] = loan_amount
                     pdf_url = generate_sanction_letter(user_data, loan_amount, phone_number)
                     base_url = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("BASE_URL", "http://localhost:8000"))
                     download_link = f"{base_url}{pdf_url}"
-                    response_msg = f"Salary slip verified (Amount: Rs. {salary_found})! Loan conditionally approved based on verified salary. Your sanction letter is ready. You can download it here: {download_link}"
-                    return {**state, "response": response_msg, "active_agent": "underwriting", "uploaded_image": "", "customer_details": user_data}
+                    response_msg = (
+                        f"✅ **Loan Conditionally Approved!**\n\n"
+                        f"Salary slip verified (Monthly Salary: ₹{salary_found:,}).\n"
+                        f"**EMI:** ₹{emi:,.2f}/month — this is within 50% of your verified salary.\n\n"
+                        f"Your sanction letter is ready. You can download it here: {download_link}"
+                    )
+                    return {**state, "response": response_msg, "active_agent": "underwriting",
+                            "uploaded_image": "", "customer_details": user_data}
                 else:
-                    return {**state, "response": f"Loan rejected: Your verified salary (Rs. {salary_found}) is insufficient to support the requested loan amount of Rs. {loan_amount}.", "active_agent": "underwriting", "uploaded_image": ""}
-            
-            return {**state, "response": "Please provide your salary slip.", "active_agent": "underwriting"}
-        else:
-            reasons = []
-            if score <= 700:
-                reasons.append(f"Credit score ({score}) is below our minimum requirement of 700")
-            reason_str = ", ".join(reasons) if reasons else "Does not meet our internal lending policies"
-            return {**state, "response": f"Loan rejected: {reason_str}.", "active_agent": "underwriting"}
+                    response_msg = (
+                        f"❌ **Loan Rejected.**\n\n"
+                        f"Your verified monthly salary is ₹{salary_found:,}.\n"
+                        f"The expected EMI of ₹{emi:,.2f}/month exceeds 50% of your salary (₹{max_allowed_emi:,.2f}).\n"
+                        f"Please consider applying for a lower loan amount."
+                    )
+                    return {**state, "response": response_msg, "active_agent": "underwriting", "uploaded_image": ""}
+
+            # No salary slip uploaded yet — ask for it
+            emi_estimate = calculate_emi(loan_amount)
+            return {**state, "response": (
+                f"Your requested loan of ₹{loan_amount:,} exceeds your pre-approved limit of ₹{limit:,}, "
+                f"but is within the extended eligible range.\n\n"
+                f"To proceed, please **upload your salary slip** for verification. "
+                f"Your estimated EMI would be ₹{emi_estimate:,.2f}/month — approval requires this to be ≤ 50% of your monthly salary."
+            ), "active_agent": "underwriting", "customer_details": user_data}
 
     return {**state, "response": "Cannot underwrite without valid details.", "active_agent": "underwriting"}
 
