@@ -3,7 +3,7 @@ import { RefreshCw, Send, Mic, HelpCircle, Paperclip, X, Square, Trash2, Volume2
 import './App.css';
 
 // API base URL — switch between local and deployed
-// const API_BASE = 'http://localhost:8000';
+//const API_BASE = 'http://localhost:8000';
 const API_BASE = 'https://nbfc-ai-backend.onrender.com';
 
 function App() {
@@ -117,7 +117,7 @@ function App() {
       const checkSilence = () => {
         if (!mediaRecorderRef.current || mediaRecorderRef.current.state !== 'recording') return;
         analyser.getByteTimeDomainData(dataArray);
-
+        
         let sum = 0;
         for (let i = 0; i < bufferLength; i++) {
           const val = (dataArray[i] - 128) / 128;
@@ -143,7 +143,7 @@ function App() {
 
       mediaRecorder.onstop = async () => {
         if (silenceTimerRef.current) cancelAnimationFrame(silenceTimerRef.current);
-        if (audioContextRef.current) { try { audioContextRef.current.close(); } catch (e) { } }
+        if (audioContextRef.current) { try { audioContextRef.current.close(); } catch(e) {} }
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
         stream.getTracks().forEach(track => track.stop());
         await processAudio(audioBlob);
@@ -233,7 +233,7 @@ function App() {
         let cleanText = text.replace(/\*\*(.*?)\*\*/g, '$1');
         cleanText = cleanText.replace(/[*_#`✅❌]/g, '');
         cleanText = cleanText.replace(/https?:\/\/\S+/g, 'link provided');
-
+        
         const utterance = new SpeechSynthesisUtterance(cleanText);
         utterance.rate = 1.05;
         utterance.pitch = 1.0;
