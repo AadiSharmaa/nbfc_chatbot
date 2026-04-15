@@ -3,8 +3,8 @@ import { RefreshCw, Send, Mic, HelpCircle, Paperclip, X, Square, Trash2, Volume2
 import './App.css';
 
 // API base URL — switch between local and deployed
-// const API_BASE = 'http://localhost:8000';
-const API_BASE = 'https://nbfc-ai-backend.onrender.com';
+const API_BASE = 'http://localhost:8000';
+// const API_BASE = 'https://nbfc-ai-backend.onrender.com';
 
 function App() {
   const [messages, setMessages] = useState([]);
@@ -37,6 +37,8 @@ function App() {
   const audioChunksRef = useRef([]);
   const graphStateRef = useRef(graphState);
   const currentAudioRef = useRef(null);
+  const silenceTimerRef = useRef(null);
+  const audioContextRef = useRef(null);
 
   // Keep ref in sync for beforeunload handler
   useEffect(() => {
@@ -96,11 +98,52 @@ function App() {
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
 
+      // Set up silence detection using Web Audio API
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      audioContextRef.current = audioContext;
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.minDecibels = -90;
+      analyser.maxDecibels = -10;
+      source.connect(analyser);
+
+      const bufferLength = analyser.fftSize;
+      const dataArray = new Uint8Array(bufferLength);
+      let silenceStart = null;
+      const SILENCE_THRESHOLD = 15;
+      const SILENCE_DURATION = 2000; // 2 seconds of silence to auto-stop
+
+      const checkSilence = () => {
+        if (!mediaRecorderRef.current || mediaRecorderRef.current.state !== 'recording') return;
+        analyser.getByteTimeDomainData(dataArray);
+        
+        let sum = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          const val = (dataArray[i] - 128) / 128;
+          sum += val * val;
+        }
+        const rms = Math.sqrt(sum / bufferLength) * 100;
+
+        if (rms < SILENCE_THRESHOLD) {
+          if (!silenceStart) silenceStart = Date.now();
+          else if (Date.now() - silenceStart > SILENCE_DURATION) {
+            stopRecording();
+            return;
+          }
+        } else {
+          silenceStart = null;
+        }
+        silenceTimerRef.current = requestAnimationFrame(checkSilence);
+      };
+
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) audioChunksRef.current.push(event.data);
       };
 
       mediaRecorder.onstop = async () => {
+        if (silenceTimerRef.current) cancelAnimationFrame(silenceTimerRef.current);
+        if (audioContextRef.current) { try { audioContextRef.current.close(); } catch(e) {} }
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
         stream.getTracks().forEach(track => track.stop());
         await processAudio(audioBlob);
@@ -108,6 +151,9 @@ function App() {
 
       mediaRecorder.start();
       setIsRecording(true);
+
+      // Start silence detection after a brief delay (let user start speaking)
+      setTimeout(() => checkSilence(), 1500);
     } catch (err) {
       console.error("Microphone access denied:", err);
       alert("Microphone access is required for voice input.");
@@ -115,7 +161,11 @@ function App() {
   };
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
+    if (silenceTimerRef.current) {
+      cancelAnimationFrame(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop();
       setIsRecording(false);
     }
@@ -136,6 +186,10 @@ function App() {
       currentAudioRef.current = null;
       setIsSpeaking(false);
     }
+    // Also stop browser speechSynthesis if active
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
   };
 
   const playTTS = async (text) => {
@@ -148,10 +202,10 @@ function App() {
         body: JSON.stringify({ text })
       });
 
-      if (!response.ok) return;
+      if (!response.ok) throw new Error('TTS request failed');
 
       const contentType = response.headers.get('content-type');
-      if (!contentType || !contentType.includes('audio')) return;
+      if (!contentType || !contentType.includes('audio')) throw new Error('No audio in response');
 
       const audioBlob = await response.blob();
       const audioUrl = URL.createObjectURL(audioBlob);
@@ -172,8 +226,25 @@ function App() {
 
       await audio.play();
     } catch (err) {
-      console.error('TTS playback error:', err);
-      setIsSpeaking(false);
+      console.warn('Groq TTS failed, using browser speech:', err.message);
+      // Fallback: use browser's built-in speech synthesis
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        let cleanText = text.replace(/\*\*(.*?)\*\*/g, '$1');
+        cleanText = cleanText.replace(/[*_#`✅❌]/g, '');
+        cleanText = cleanText.replace(/https?:\/\/\S+/g, 'link provided');
+        
+        const utterance = new SpeechSynthesisUtterance(cleanText);
+        utterance.rate = 1.05;
+        utterance.pitch = 1.0;
+        utterance.onstart = () => setIsSpeaking(true);
+        utterance.onend = () => { setIsSpeaking(false); currentAudioRef.current = null; };
+        utterance.onerror = () => { setIsSpeaking(false); currentAudioRef.current = null; };
+        currentAudioRef.current = { pause: () => window.speechSynthesis.cancel(), currentTime: 0 };
+        window.speechSynthesis.speak(utterance);
+      } else {
+        setIsSpeaking(false);
+      }
     }
   };
 
