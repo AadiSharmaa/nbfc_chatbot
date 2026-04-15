@@ -319,84 +319,183 @@ def calculate_emi(principal: int, annual_rate: float = 12.0, tenure_months: int 
 
 def underwriting_agent(state: GraphState) -> GraphState:
     user_data = state.get('customer_details', {})
+    user_text_lower = state.get("user_input", "").lower()
     
-    if user_data and state.get('otp_verified'):
-        phone_number = user_data.get("phone", "Unknown")
-        score = user_data.get("credit_score", 0)
-        limit = user_data.get("pre_approved_limit", 0)
-        salary = user_data.get("salary", 0)
-        loan_amount = user_data.get("loan_amount", 0)
+    if not (user_data and state.get('otp_verified')):
+        return {**state, "response": "Cannot underwrite without valid KYC verification.", "active_agent": "underwriting"}
+
+    # Handle negative response to conditional approval or document requests
+    negative_affirmations = ["no", "nope", "cancel", "decline", "reject", "don't", "not"]
+    if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in negative_affirmations):
+        return {
+            **state,
+            "response": "You have declined the offer or cancelled the process. Your application has been closed. Let us know if you need any other assistance in the future! Type 'done' to end the chat.",
+            "active_agent": "master"
+        }
+
+    phone_number = user_data.get("phone", "Unknown")
+    credit_score = user_data.get("credit_score", 0)
+    salary = user_data.get("salary", 0)
+    pre_limit = user_data.get("pre_approved_limit", None)
+
+    # Extract loan amount
+    loan_amount = user_data.get("loan_amount", 0)
+    if loan_amount == 0 and state.get("chat_history"):
+        loan_amount = extract_loan_amount(state.get("chat_history"))
+        user_data["loan_amount"] = loan_amount
+
+    if loan_amount <= 0:
+        return {**state, "response": "Please specify the loan amount to proceed.", "active_agent": "underwriting"}
+
+    # --- BASIC EMI CALCULATION ---
+    emi = calculate_emi(loan_amount)
+    
+    base_url = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("BASE_URL", "http://localhost:8000"))
+
+    # --- PRE-APPROVED LIMIT CONDITIONS ---
+    if pre_limit and pre_limit > 0 and loan_amount <= pre_limit:
+        # Condition 1: If requested amount is within pre-approved limit, approve immediately
+        pdf_url = generate_sanction_letter(user_data, loan_amount, phone_number)
+        download_link = f"{base_url}{pdf_url}"
         
-        if loan_amount == 0 and state.get("chat_history"):
-            loan_amount = extract_loan_amount(state.get("chat_history"))
-            user_data["loan_amount"] = loan_amount
+        return {
+            **state,
+            "response": (
+                f"✅ **Loan Approved!**\n\n"
+                f"Your requested amount of ₹{loan_amount:,} is within your pre-approved limit.\n"
+                f"EMI: ₹{emi:,.2f}/month\n\n"
+                f"Download your sanction letter: {download_link}"
+            ),
+            "active_agent": "underwriting"
+        }
 
-        # --- REJECTION CONDITIONS (check first) ---
-        # Reject if credit score < 700
-        if score < 700:
-            return {**state, "response": f"Loan rejected: Your credit score ({score}) is below our minimum requirement of 700.",
-                    "active_agent": "underwriting", "customer_details": user_data}
+    # Condition 2 & 3: Loan > pre-approved limit, or no limit available.
+    # We must calculate risk score and require a salary slip upload.
+    if not state.get("uploaded_image"):
+        return {
+            **state,
+            "response": "To evaluate your requested loan amount, please upload your recent salary slip for income verification.",
+            "active_agent": "underwriting"
+        }
 
-        # Reject if loan amount > 2× pre-approved limit
-        if loan_amount > 2 * limit:
-            return {**state, "response": (
-                f"Loan rejected: The requested amount of ₹{loan_amount:,} exceeds the maximum eligible limit of ₹{2 * limit:,} "
-                f"(2× your pre-approved limit of ₹{limit:,}). Please apply for a lower amount."
-            ), "active_agent": "underwriting", "customer_details": user_data}
+    if state.get("uploaded_image"):
+        salary = verify_salary_slip(state["uploaded_image"])
+        user_data["salary"] = salary
+        state["uploaded_image"] = None  # Clear the image so it isn't looped
 
-        # --- TIER 1: Instant Approval (loan ≤ pre-approved limit) ---
-        if loan_amount <= limit:
-            pdf_url = generate_sanction_letter(user_data, loan_amount, phone_number)
-            base_url = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("BASE_URL", "http://localhost:8000"))
-            download_link = f"{base_url}{pdf_url}"
-            emi = calculate_emi(loan_amount)
-            response_msg = (
-                f"✅ **Loan Approved Instantly!**\n\n"
-                f"Your requested amount of ₹{loan_amount:,} is within your pre-approved limit of ₹{limit:,}.\n"
-                f"**Estimated EMI:** ₹{emi:,.2f}/month (at 12% p.a. for 60 months)\n\n"
-                f"Your sanction letter is ready. You can download it here: {download_link}"
-            )
-            return {**state, "response": response_msg, "active_agent": "underwriting", "customer_details": user_data}
+    if salary <= 0:
+        return {
+            **state,
+            "response": "Unable to verify your income from the document. Please upload a clear, valid salary slip.",
+            "active_agent": "underwriting"
+        }
 
-        # --- TIER 2: Conditional Approval (limit < loan ≤ 2× limit) — needs salary slip ---
-        if loan_amount <= 2 * limit:
-            if state.get("uploaded_image"):
-                salary_found = verify_salary_slip(state["uploaded_image"])
-                emi = calculate_emi(loan_amount)
-                max_allowed_emi = salary_found * 0.50  # EMI must be ≤ 50% of salary
+    # --- DTI Calculation ---
+    dti = emi / salary  # debt-to-income ratio
 
-                if emi <= max_allowed_emi:
-                    user_data["pre_approved_limit"] = loan_amount
-                    pdf_url = generate_sanction_letter(user_data, loan_amount, phone_number)
-                    base_url = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("BASE_URL", "http://localhost:8000"))
-                    download_link = f"{base_url}{pdf_url}"
-                    response_msg = (
-                        f"✅ **Loan Conditionally Approved!**\n\n"
-                        f"Salary slip verified (Monthly Salary: ₹{salary_found:,}).\n"
-                        f"**EMI:** ₹{emi:,.2f}/month — this is within 50% of your verified salary.\n\n"
-                        f"Your sanction letter is ready. You can download it here: {download_link}"
-                    )
-                    return {**state, "response": response_msg, "active_agent": "underwriting",
-                            "uploaded_image": "", "customer_details": user_data}
-                else:
-                    response_msg = (
-                        f"❌ **Loan Rejected.**\n\n"
-                        f"Your verified monthly salary is ₹{salary_found:,}.\n"
-                        f"The expected EMI of ₹{emi:,.2f}/month exceeds 50% of your salary (₹{max_allowed_emi:,.2f}).\n"
-                        f"Please consider applying for a lower loan amount."
-                    )
-                    return {**state, "response": response_msg, "active_agent": "underwriting", "uploaded_image": ""}
+    # --- HARD REJECTION RULES ---
+    if credit_score < 650:
+        return {
+            **state,
+            "response": f"❌ Loan Rejected: Credit score ({credit_score}) is below minimum threshold (650).",
+            "active_agent": "underwriting"
+        }
 
-            # No salary slip uploaded yet — ask for it
-            emi_estimate = calculate_emi(loan_amount)
-            return {**state, "response": (
-                f"Your requested loan of ₹{loan_amount:,} exceeds your pre-approved limit of ₹{limit:,}, "
-                f"but is within the extended eligible range.\n\n"
-                f"To proceed, please **upload your salary slip** for verification. "
-                f"Your estimated EMI would be ₹{emi_estimate:,.2f}/month — approval requires this to be ≤ 50% of your monthly salary."
-            ), "active_agent": "underwriting", "customer_details": user_data}
+    if dti > 0.6:
+        return {
+            **state,
+            "response": (
+                f"❌ Loan Rejected:\n"
+                f"Your EMI ₹{emi:,.2f} exceeds 60% of your monthly income ₹{salary:,}.\n"
+                f"Please apply for a lower amount."
+            ),
+            "active_agent": "underwriting"
+        }
 
-    return {**state, "response": "Cannot underwrite without valid details.", "active_agent": "underwriting"}
+    # --- RISK SCORING ---
+    score = 0
+
+    # Credit score weight (40%)
+    if credit_score >= 750:
+        score += 40
+    elif credit_score >= 700:
+        score += 30
+    elif credit_score >= 650:
+        score += 20
+
+    # DTI weight (30%)
+    if dti < 0.3:
+        score += 30
+    elif dti < 0.5:
+        score += 20
+    else:
+        score += 10
+
+    # Income strength (20%)
+    if salary >= 100000:
+        score += 20
+    elif salary >= 50000:
+        score += 15
+    else:
+        score += 10
+
+    # Loan size vs income (10%)
+    loan_to_income = loan_amount / (salary * 12)
+    if loan_to_income < 0.5:
+        score += 10
+    elif loan_to_income < 1:
+        score += 7
+    else:
+        score += 4
+
+    # --- DECISION LOGIC ---
+    base_url = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("BASE_URL", "http://localhost:8000"))
+
+    # ✅ APPROVE
+    if score >= 75:
+        pdf_url = generate_sanction_letter(user_data, loan_amount, phone_number)
+        download_link = f"{base_url}{pdf_url}"
+
+        return {
+            **state,
+            "response": (
+                f"✅ **Loan Approved!**\n\n"
+                f"Risk Score: {score}/100\n"
+                f"EMI: ₹{emi:,.2f}/month\n\n"
+                f"Download your sanction letter: {download_link}"
+            ),
+            "active_agent": "underwriting"
+        }
+
+    # ⚠️ CONDITIONAL APPROVAL
+    elif score >= 55:
+        reduced_amount = int(loan_amount * 0.75)
+        reduced_emi = calculate_emi(reduced_amount)
+
+        return {
+            **state,
+            "response": (
+                f"⚠️ **Conditional Approval**\n\n"
+                f"Risk Score: {score}/100\n"
+                f"The requested amount is slightly risky.\n\n"
+                f"You are eligible for ₹{reduced_amount:,} instead.\n"
+                f"New EMI: ₹{reduced_emi:,.2f}/month\n\n"
+                f"Reply 'YES' to proceed with revised offer."
+            ),
+            "active_agent": "underwriting"
+        }
+
+    # ❌ REJECT
+    else:
+        return {
+            **state,
+            "response": (
+                f"❌ **Loan Rejected**\n\n"
+                f"Risk Score: {score}/100\n"
+                f"Reason: High risk based on income, credit profile, and repayment capacity."
+            ),
+            "active_agent": "underwriting"
+        }
 
 
 
@@ -406,9 +505,18 @@ def master_router(state: GraphState) -> Literal["sales_node", "verification_node
     if user_text.lower() == "done":
         return "exit"
 
+    if state.get("uploaded_image"):
+        return "underwriting_node"
+
     if state.get("otp_verified") and state.get("active_agent") == "underwriting":
-        positive_affirmations = ["yes", "proceed", "ok", "sure", "yeah", "yep", "do it"]
-        if any(word in user_text.lower() for word in positive_affirmations):
+        user_text_lower = user_text.lower()
+        positive_affirmations = ["yes", "proceed", "ok", "sure", "yeah", "yep", "do it", "accept"]
+        negative_affirmations = ["no", "nope", "cancel", "decline", "reject", "don't", "not"]
+        
+        if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in positive_affirmations):
+            return "underwriting_node"
+            
+        if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in negative_affirmations):
             return "underwriting_node"
 
     if re.search(r"\b\d{10}\b", user_text) or state.get("expected_otp"):
