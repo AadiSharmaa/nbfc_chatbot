@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from fpdf import FPDF
+from twilio.rest import Client as TwilioClient
 from memory import init_memory_db, get_conversation_summary, save_conversation_summary, delete_conversation_memory, summarize_conversation
 
 # ---------------------------------------------------------
@@ -56,11 +57,44 @@ CRM_DATABASE = {
         "salary": 55000,
         "pre_approved_limit": 250000,
         "credit_score": 680
+    },
+     "7903418955": {
+        "name": "Rohit Shukla",
+        "city": "Patna",
+        "address": "123, Boring Road, Patna",
+        "salary": 90000,
+        "pre_approved_limit": 600000,
+        "credit_score": 715
     }
 }
 
 def search_crm(phone_number):
     return CRM_DATABASE.get(phone_number)
+
+# ---------------------------------------------------------
+# Twilio SMS OTP Setup
+# ---------------------------------------------------------
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
+
+def send_otp_sms(phone_number: str, otp: str) -> bool:
+    """Send OTP via Twilio SMS. Returns True if sent successfully, False otherwise."""
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]):
+        print("[OTP] Twilio not configured, skipping SMS.")
+        return False
+    try:
+        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        message = twilio_client.messages.create(
+            body=f"Your BriskAI verification OTP is: {otp}. Valid for 5 minutes.",
+            from_=TWILIO_PHONE_NUMBER,
+            to=f"+91{phone_number}"  # Indian phone number format
+        )
+        print(f"[OTP] SMS sent to +91{phone_number}, SID: {message.sid}")
+        return True
+    except Exception as e:
+        print(f"[OTP] Twilio error: {e}")
+        return False
 
 # ---------------------------------------------------------
 # 3. Agent Functions
@@ -153,12 +187,23 @@ def verification_agent(state: GraphState) -> GraphState:
             else:
                 greeting_extra = ""
 
-            response_text = (
-                f"Hi {user_details.get('name', '')}, we found your profile.{greeting_extra}\n"
-                f"For KYC verification, a 4-digit OTP has been sent to **{phone}**.\n"
-                f"*(Demo OTP: {otp})*\n\n"
-                "Please type the OTP here to complete verification."
-            )
+            # Send OTP via SMS using Twilio
+            otp_sent = send_otp_sms(phone, otp)
+
+            if otp_sent:
+                response_text = (
+                    f"Hi {user_details.get('name', '')}, we found your profile.{greeting_extra}\n"
+                    f"For KYC verification, a 4-digit OTP has been sent to **{phone}**.\n\n"
+                    "Please type the OTP here to complete verification."
+                )
+            else:
+                # Fallback for demo/testing when Twilio not configured
+                response_text = (
+                    f"Hi {user_details.get('name', '')}, we found your profile.{greeting_extra}\n"
+                    f"For KYC verification, a 4-digit OTP has been sent to **{phone}**.\n"
+                    f"*(Demo OTP: {otp})*\n\n"
+                    "Please type the OTP here to complete verification."
+                )
             return {**state, "response": response_text, "customer_details": user_details,
                     "expected_otp": otp, "otp_verified": False, "active_agent": "verification",
                     "memory_context": memory_context}
@@ -370,23 +415,13 @@ def underwriting_agent(state: GraphState) -> GraphState:
         }
 
     # Condition 2 & 3: Loan > pre-approved limit, or no limit available.
-    # We must calculate risk score and require a salary slip upload.
-    if not state.get("uploaded_image"):
-        return {
-            **state,
-            "response": "To evaluate your requested loan amount, please upload your recent salary slip for income verification.",
-            "active_agent": "underwriting"
-        }
-
-    if state.get("uploaded_image"):
-        salary = verify_salary_slip(state["uploaded_image"])
-        user_data["salary"] = salary
-        state["uploaded_image"] = None  # Clear the image so it isn't looped
+    # Use salary from CRM database for income verification.
+    salary = user_data.get("salary", 0)
 
     if salary <= 0:
         return {
             **state,
-            "response": "Unable to verify your income from the document. Please upload a clear, valid salary slip.",
+            "response": "Unable to verify your income from our records. Please contact support.",
             "active_agent": "underwriting"
         }
 
@@ -673,7 +708,7 @@ async def tts_endpoint(req: TTSRequest):
 
         response = client.audio.speech.create(
             model="canopylabs/orpheus-v1-english",
-            voice="tara",
+            voice="diana",
             input=clean_text,
             response_format="wav"
         )
