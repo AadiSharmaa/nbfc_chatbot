@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { RefreshCw, Send, Mic, HelpCircle, Paperclip, X, Square, Trash2 } from 'lucide-react';
+import { RefreshCw, Send, Mic, HelpCircle, Paperclip, X, Square, Trash2, Volume2, VolumeX } from 'lucide-react';
 import './App.css';
 
 // API base URL — switch between local and deployed
@@ -15,6 +15,8 @@ function App() {
   const [selectedImage, setSelectedImage] = useState(null);
   const [imagePreview, setImagePreview] = useState(null);
   const [isRecording, setIsRecording] = useState(false);
+  const [isTTSEnabled, setIsTTSEnabled] = useState(true);
+  const [isSpeaking, setIsSpeaking] = useState(false);
   const [showForgetModal, setShowForgetModal] = useState(false);
   const [forgetPhone, setForgetPhone] = useState('');
   const [forgetStatus, setForgetStatus] = useState(null);
@@ -34,6 +36,7 @@ function App() {
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const graphStateRef = useRef(graphState);
+  const currentAudioRef = useRef(null);
 
   // Keep ref in sync for beforeunload handler
   useEffect(() => {
@@ -126,6 +129,54 @@ function App() {
     }
   };
 
+  const stopCurrentAudio = () => {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current.currentTime = 0;
+      currentAudioRef.current = null;
+      setIsSpeaking(false);
+    }
+  };
+
+  const playTTS = async (text) => {
+    if (!isTTSEnabled || !text) return;
+    stopCurrentAudio();
+    try {
+      const response = await fetch(`${API_BASE}/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+      });
+
+      if (!response.ok) return;
+
+      const contentType = response.headers.get('content-type');
+      if (!contentType || !contentType.includes('audio')) return;
+
+      const audioBlob = await response.blob();
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      currentAudioRef.current = audio;
+
+      audio.onplay = () => setIsSpeaking(true);
+      audio.onended = () => {
+        setIsSpeaking(false);
+        currentAudioRef.current = null;
+        URL.revokeObjectURL(audioUrl);
+      };
+      audio.onerror = () => {
+        setIsSpeaking(false);
+        currentAudioRef.current = null;
+        URL.revokeObjectURL(audioUrl);
+      };
+
+      await audio.play();
+    } catch (err) {
+      console.error('TTS playback error:', err);
+      setIsSpeaking(false);
+    }
+  };
+
   const processAudio = async (audioBlob) => {
     setIsLoading(true);
     try {
@@ -150,6 +201,7 @@ function App() {
   };
 
   const handleSend = async (text) => {
+    stopCurrentAudio();
     const userText = text || input;
     if (!userText.trim() && !selectedImage) return;
 
@@ -181,6 +233,9 @@ function App() {
       const data = await response.json();
       setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
       setGraphState(data.state);
+
+      // Auto-play TTS for the assistant response
+      playTTS(data.response);
 
     } catch (error) {
       console.error("Backend connection error:", error);
@@ -258,6 +313,13 @@ function App() {
           BriskAI
         </div>
         <div className="header-actions">
+          <button
+            className={`icon-btn speaker-btn ${isTTSEnabled ? 'active' : ''}`}
+            onClick={() => { if (isTTSEnabled) stopCurrentAudio(); setIsTTSEnabled(prev => !prev); }}
+            title={isTTSEnabled ? 'Mute voice' : 'Enable voice'}
+          >
+            {isTTSEnabled ? <Volume2 size={18} /> : <VolumeX size={18} />}
+          </button>
           <button className="icon-btn forget-btn" onClick={() => { setShowForgetModal(true); setForgetStatus(null); setForgetPhone(''); }} title="Forget Me">
             <Trash2 size={18} />
           </button>
@@ -296,8 +358,15 @@ function App() {
           <div className="chat-history">
             {messages.map((msg, index) => (
               <div key={index} className={`message-wrapper ${msg.role}`}>
-                <div className="message-bubble">
+                <div className={`message-bubble ${msg.role === 'assistant' && isSpeaking && index === messages.length - 1 ? 'speaking' : ''}`}>
                   {renderMessageContent(msg.content)}
+                  {msg.role === 'assistant' && isSpeaking && index === messages.length - 1 && (
+                    <div className="speaking-indicator">
+                      <span className="speaking-dot"></span>
+                      <span className="speaking-dot"></span>
+                      <span className="speaking-dot"></span>
+                    </div>
+                  )}
                 </div>
               </div>
             ))}

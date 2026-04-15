@@ -1,4 +1,5 @@
 import os
+import io
 import re
 import random
 import uuid
@@ -9,6 +10,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from groq import Groq
 from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI, UploadFile, File, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -513,6 +515,9 @@ class ChatRequest(BaseModel):
     image: Optional[str] = None
     session_id: Optional[str] = None
 
+class TTSRequest(BaseModel):
+    text: str
+
 class EndSessionRequest(BaseModel):
     chat_history: list
     customer_details: Dict[str, Any]
@@ -538,6 +543,42 @@ async def transcribe_endpoint(audio: UploadFile = File(...)):
     except Exception as e:
         print(f"Transcription error: {e}")
         return {"error": str(e), "text": ""}
+
+@app.post("/tts")
+async def tts_endpoint(req: TTSRequest):
+    """Convert text to speech using Groq's TTS API and stream WAV audio back."""
+    try:
+        # Clean markdown formatting from text for cleaner speech
+        clean_text = req.text
+        clean_text = re.sub(r'\*\*(.*?)\*\*', r'\1', clean_text)  # Remove bold
+        clean_text = re.sub(r'[\*\_\#\`]', '', clean_text)  # Remove other markdown
+        clean_text = re.sub(r'https?://\S+', 'link provided', clean_text)  # Replace URLs
+        clean_text = re.sub(r'[✅❌]', '', clean_text)  # Remove emojis that TTS can't speak
+        clean_text = clean_text.strip()
+
+        if not clean_text:
+            return {"error": "No text to speak"}
+
+        # Truncate very long text to avoid TTS timeouts
+        if len(clean_text) > 1500:
+            clean_text = clean_text[:1500] + '... and more details are shown in the chat.'
+
+        response = client.audio.speech.create(
+            model="canopylabs/orpheus-v1-english",
+            voice="tara",
+            input=clean_text,
+            response_format="wav"
+        )
+
+        audio_bytes = response.read()
+        return StreamingResponse(
+            io.BytesIO(audio_bytes),
+            media_type="audio/wav",
+            headers={"Content-Length": str(len(audio_bytes))}
+        )
+    except Exception as e:
+        print(f"TTS error: {e}")
+        return {"error": str(e)}
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):

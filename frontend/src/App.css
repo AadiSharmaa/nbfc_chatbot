@@ -366,6 +366,86 @@ body {
   background-color: #fef2f2 !important;
 }
 
+/* Speaker Toggle */
+.speaker-btn.active {
+  color: #2563eb;
+}
+
+.speaker-btn.active:hover {
+  background-color: #eff6ff !important;
+}
+
+.speaker-btn:not(.active) {
+  color: #9ca3af;
+}
+
+.speaker-btn:not(.active):hover {
+  color: #6b7280;
+}
+
+/* Speaking Indicator */
+.speaking-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 8px;
+  vertical-align: middle;
+  padding-top: 6px;
+}
+
+.speaking-dot {
+  width: 4px;
+  height: 4px;
+  background-color: #2563eb;
+  border-radius: 50%;
+  animation: speakingBounce 1.2s ease-in-out infinite;
+}
+
+.speaking-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.speaking-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes speakingBounce {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  30% {
+    transform: translateY(-6px);
+    opacity: 1;
+  }
+}
+
+/* Speaking glow on message bubble */
+.message-bubble.speaking {
+  position: relative;
+}
+
+.message-bubble.speaking::before {
+  content: '';
+  position: absolute;
+  left: -4px;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: linear-gradient(180deg, #3b82f6, #8b5cf6);
+  border-radius: 3px;
+  animation: speakingPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes speakingPulse {
+  0%, 100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 /* Floating Help Button */
 .help-fab {
   position: fixed;
