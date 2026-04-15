@@ -3,8 +3,8 @@ import { RefreshCw, Send, Mic, HelpCircle, Paperclip, X, Square, Trash2, Volume2
 import './App.css';
 
 // API base URL — switch between local and deployed
-const API_BASE = 'http://localhost:8000';
-// const API_BASE = 'https://nbfc-ai-backend.onrender.com';
+//const API_BASE = 'http://localhost:8000';
+const API_BASE = 'https://nbfc-ai-backend.onrender.com';
 
 function App() {
   const [messages, setMessages] = useState([]);
