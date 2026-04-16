@@ -65,6 +65,14 @@ CRM_DATABASE = {
         "salary": 90000,
         "pre_approved_limit": 600000,
         "credit_score": 715
+    },
+    "9366001871": {
+        "name": "Divya Kumari",
+        "city": "Dehradun",
+        "address": "189, Rajpur Road, Dehradun",
+        "salary": 50000,
+        "pre_approved_limit": 600000,
+        "credit_score": 765
     }
 }
 
@@ -127,16 +135,24 @@ def sales_agent(state: GraphState) -> GraphState:
     if memory_ctx:
         context_block = f"\n\nCONTEXT FROM PREVIOUS INTERACTIONS WITH THIS CUSTOMER:\n{memory_ctx}\nUse this context to personalize the conversation. Reference past interactions naturally (e.g., 'Welcome back!' or 'Last time you were looking at...'). Do NOT repeat the summary verbatim.\n"
 
+    otp_verified = state.get("otp_verified", False)
+    if otp_verified:
+        handoff_rule = 'HANDOFF RULE: Once you have collected ALL 4 items on your checklist AND the purpose is acceptable, summarize the new terms and EXPLICITLY ask the user "Shall I proceed to check approval for this new amount?". DO NOT ask for their mobile number or KYC again.'
+    else:
+        handoff_rule = 'HANDOFF RULE: Once you have collected ALL 4 items on your checklist AND the purpose is acceptable, summarize the terms and EXPLICITLY ask the user to "please enter your 10-digit mobile number to proceed with KYC verification."'
+
     prompt = f"""You are a Sales Agent for an NBFC negotiating loan terms.
     Internal Checklist: Amount, Tenure, Purpose, Employment Type.
     {context_block}
+    User is already KYC Verified: {"Yes" if otp_verified else "No"}
+    
     CONVERSATION GUIDELINES:
     1. RELEVANT QUESTIONS: If the user asks general questions about loans, interest rates, or banking, answer them openly and then gently guide the conversation back to collecting the missing checklist items.
     2. IRRELEVANT QUESTIONS: If the user asks about unrelated topics (e.g., cars, food, general chat), politely state that this is outside your expertise and steer them back to the loan application process.
     3. STRICT COMPLIANCE RULE: You MUST validate the 'Purpose'. Acceptable purposes are: Business Expansion, Medical Emergency, Education, Home Renovation, or Vehicle Purchase. If the user states ANY other purpose (like food, daily expenses, gambling, etc.), you MUST politely inform them that NBFC policy does not permit lending for this purpose. DO NOT ask for any more checklist items! Reject the loan immediately.
     4. CRITICAL: Never repeat questions. Acknowledge user input and ask ONLY for the missing items. Keep answers precise.
 
-    HANDOFF RULE: Once you have collected ALL 4 items on your checklist AND the purpose is acceptable, summarize the terms and EXPLICITLY ask the user to \"please enter your 10-digit mobile number to proceed with KYC verification.\" """
+    {handoff_rule} """
 
     response_text, updated_history = ask_gemini(
         prompt,
@@ -287,40 +303,37 @@ def verify_salary_slip(base64_img: str) -> int:
 
 def extract_loan_amount_regex(chat_history: list) -> int:
     """Try to extract loan amount from chat text using regex patterns for Indian currency expressions."""
-    # Combine all user messages into one text block
-    user_text = " ".join(
-        str(msg.get("content", "")) for msg in chat_history if msg.get("role") == "user"
-    ).lower()
-    
-    # Also check assistant summaries (they often restate the amount clearly)
-    all_text = " ".join(
-        str(msg.get("content", "")) for msg in chat_history
-    ).lower()
+    # Check from newest to oldest message to get the latest negotiated amount
+    for msg in reversed(chat_history):
+        text = str(msg.get("content", "")).lower()
+        
+        # Pattern: "10 lakh", "10 lakhs", "10 lac", "10lakh", "₹10 lakh"
+        lakh_match = re.search(r'[\₹rs\.?\s]*(\d+(?:\.\d+)?)\s*(?:lakh|lakhs|lac|lacs)\b', text)
+        if lakh_match:
+            return int(float(lakh_match.group(1)) * 100000)
 
-    # Pattern: "10 lakh", "10 lakhs", "10 lac", "10lakh", "₹10 lakh"
-    lakh_match = re.search(r'[\₹rs\.?\s]*(\d+(?:\.\d+)?)\s*(?:lakh|lakhs|lac|lacs)\b', all_text)
-    if lakh_match:
-        return int(float(lakh_match.group(1)) * 100000)
+        # Pattern: "5 crore", "5 crores", "5 cr"
+        crore_match = re.search(r'[\₹rs\.?\s]*(\d+(?:\.\d+)?)\s*(?:crore|crores|cr)\b', text)
+        if crore_match:
+            return int(float(crore_match.group(1)) * 10000000)
 
-    # Pattern: "10,00,000" or "1000000" (Indian notation for lakhs)
-    indian_match = re.search(r'[\₹rs\.?\s]*(\d{1,2},\d{2},\d{3})', all_text)
-    if indian_match:
-        return int(indian_match.group(1).replace(',', ''))
+        # Pattern: "10,00,000" or "1000000" (Indian notation for lakhs)
+        indian_match = re.search(r'[\₹rs\.?\s]*(\d{1,2},\d{2},\d{3})', text)
+        if indian_match:
+            return int(indian_match.group(1).replace(',', ''))
 
-    # Pattern: "500k", "500K"
-    k_match = re.search(r'[\₹rs\.?\s]*(\d+(?:\.\d+)?)\s*k\b', all_text)
-    if k_match:
-        return int(float(k_match.group(1)) * 1000)
+        # Pattern: "500k", "500K"
+        k_match = re.search(r'[\₹rs\.?\s]*(\d+(?:\.\d+)?)\s*k\b', text)
+        if k_match:
+            return int(float(k_match.group(1)) * 1000)
 
-    # Pattern: "5 crore", "5 crores", "5 cr"
-    crore_match = re.search(r'[\₹rs\.?\s]*(\d+(?:\.\d+)?)\s*(?:crore|crores|cr)\b', all_text)
-    if crore_match:
-        return int(float(crore_match.group(1)) * 10000000)
-
-    # Pattern: plain large number like "1000000" or "500000"
-    plain_match = re.search(r'[\₹rs\.?\s]*(\d{5,})', all_text)
-    if plain_match:
-        return int(plain_match.group(1))
+    # Fallback to plain numbers if no specific format was found in recent messages
+    for msg in reversed(chat_history):
+        text = str(msg.get("content", "")).lower()
+        # Pattern: plain large number like "1000000" or "500000"
+        plain_match = re.search(r'[\₹rs\.?\s]*(\d{5,})', text)
+        if plain_match:
+            return int(plain_match.group(1))
 
     return 0
 
@@ -365,17 +378,30 @@ def calculate_emi(principal: int, annual_rate: float = 12.0, tenure_months: int 
 def underwriting_agent(state: GraphState) -> GraphState:
     user_data = state.get('customer_details', {})
     user_text_lower = state.get("user_input", "").lower()
+    last_response = state.get("response", "")
     
     if not (user_data and state.get('otp_verified')):
         return {**state, "response": "Cannot underwrite without valid KYC verification.", "active_agent": "underwriting"}
+
+    # Handle end of conversation after a decision
+    if "Loan Approved!" in last_response or "Loan Rejected" in last_response:
+        gratitude_words = ["thanks", "thank you", "awesome", "great", "cool", "nice", "bye", "ok", "okay"]
+        if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in gratitude_words) or len(user_text_lower.split()) <= 4:
+            return {
+                **state,
+                "response": "You're welcome! For any further query contact our office.",
+                "active_agent": "underwriting",
+                "is_closed": True
+            }
 
     # Handle negative response to conditional approval or document requests
     negative_affirmations = ["no", "nope", "cancel", "decline", "reject", "don't", "not"]
     if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in negative_affirmations):
         return {
             **state,
-            "response": "You have declined the offer or cancelled the process. Your application has been closed. Let us know if you need any other assistance in the future! Type 'done' to end the chat.",
-            "active_agent": "master"
+            "response": "You have declined the offer or cancelled the process. Your application has been closed. For any further query contact our office.",
+            "active_agent": "master",
+            "is_closed": True
         }
 
     phone_number = user_data.get("phone", "Unknown")
@@ -384,10 +410,13 @@ def underwriting_agent(state: GraphState) -> GraphState:
     pre_limit = user_data.get("pre_approved_limit", None)
 
     # Extract loan amount
+    # ALWAYS extract to capture the latest requested amount if a user negotiated it
+    if state.get("chat_history"):
+        new_amount = extract_loan_amount(state.get("chat_history"))
+        if new_amount > 0:
+            user_data["loan_amount"] = new_amount
+
     loan_amount = user_data.get("loan_amount", 0)
-    if loan_amount == 0 and state.get("chat_history"):
-        loan_amount = extract_loan_amount(state.get("chat_history"))
-        user_data["loan_amount"] = loan_amount
 
     if loan_amount <= 0:
         return {**state, "response": "Please specify the loan amount to proceed.", "active_agent": "underwriting"}
@@ -497,9 +526,11 @@ def underwriting_agent(state: GraphState) -> GraphState:
                 f"✅ **Loan Approved!**\n\n"
                 f"Risk Score: {score}/100\n"
                 f"EMI: ₹{emi:,.2f}/month\n\n"
-                f"Download your sanction letter: {download_link}"
+                f"Download your sanction letter: {download_link}\n\n"
+                f"For any further query contact our office."
             ),
-            "active_agent": "underwriting"
+            "active_agent": "underwriting",
+            "is_closed": True
         }
 
     # ⚠️ CONDITIONAL APPROVAL
@@ -527,9 +558,11 @@ def underwriting_agent(state: GraphState) -> GraphState:
             "response": (
                 f"❌ **Loan Rejected**\n\n"
                 f"Risk Score: {score}/100\n"
-                f"Reason: High risk based on income, credit profile, and repayment capacity."
+                f"Reason: High risk based on income, credit profile, and repayment capacity.\n\n"
+                f"For any further query contact our office."
             ),
-            "active_agent": "underwriting"
+            "active_agent": "underwriting",
+            "is_closed": True
         }
 
 
@@ -543,29 +576,38 @@ def master_router(state: GraphState) -> Literal["sales_node", "verification_node
     if state.get("uploaded_image"):
         return "underwriting_node"
 
-    if state.get("otp_verified") and state.get("active_agent") == "underwriting":
+    user_text_lower = user_text.lower()
+    last_response = state.get("response", "")
+    
+    if state.get("active_agent") == "underwriting":
+        if "Loan Approved!" in last_response or "Loan Rejected" in last_response:
+            gratitude_words = ["thanks", "thank you", "awesome", "great", "cool", "nice", "bye", "ok", "okay"]
+            if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in gratitude_words) or len(user_text.split()) <= 4:
+                return "underwriting_node"
+
+    if state.get("otp_verified"):
         user_text_lower = user_text.lower()
         positive_affirmations = ["yes", "proceed", "ok", "sure", "yeah", "yep", "do it", "accept"]
         negative_affirmations = ["no", "nope", "cancel", "decline", "reject", "don't", "not"]
         
-        if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in positive_affirmations):
-            return "underwriting_node"
-            
-        if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in negative_affirmations):
-            return "underwriting_node"
+        if state.get("active_agent") == "underwriting":
+            if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in positive_affirmations):
+                return "underwriting_node"
+            if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in negative_affirmations):
+                return "underwriting_node"
+                
+        if state.get("active_agent") == "sales":
+            if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in positive_affirmations):
+                return "underwriting_node"
 
-    if re.search(r"\b\d{10}\b", user_text) or state.get("expected_otp"):
+    if (not state.get("otp_verified")) and (re.search(r"\b\d{10}\b", user_text) or state.get("expected_otp")):
         return "verification_node"
 
     active_agent = state.get("active_agent", "master")
     chat_history = state.get("chat_history", [])
 
-    last_assistant_msg = "None"
-    if chat_history and len(chat_history) > 0:
-        for msg in reversed(chat_history):
-            if msg.get("role") == "assistant":
-                last_assistant_msg = msg.get("content")
-                break
+    recent_history = chat_history[-6:] if len(chat_history) > 6 else chat_history
+    history_text = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in recent_history])
 
     memory_ctx = state.get("memory_context", "")
     memory_block = ""
@@ -574,16 +616,20 @@ def master_router(state: GraphState) -> Literal["sales_node", "verification_node
 
     router_prompt = f"""You are a Master Routing Agent for an NBFC chatbot.
     Current Active Department: {active_agent.upper()}
-    Assistant's Last Message: "{last_assistant_msg}"
-    User's Latest Input: "{user_text}"
+    User KYC Verified: {"Yes" if state.get("otp_verified") else "No"}
+    
+    Recent Chat History:
+    {history_text}
+    
+    Current User Input: "{user_text}"
     {memory_block}
     COMPLIANCE MANDATE: Under no circumstances will you factor in the user's gender, caste, religion, or background when discussing loan terms, routing intents, or assessing risk.
 
     ROUTING RULES:
     1. CONTEXTUAL CONTINUATION: If user input directly answers the Assistant's Last Message, route to Current Active Department.
-    2. SALES: If user greets, asks about loan terms, interest rates, route to SALES.
-    3. VERIFICATION: Route to VERIFICATION if user asks to submit KYC or provides a phone number.
-    4. UNDERWRITING: After verification and negotiation the model need to approve or reject the loan offer.
+    2. SALES: If user greets, asks about loan terms, interest rates, or wants to change the loan amount/tenure, route to SALES.
+    3. VERIFICATION: Route to VERIFICATION if user asks to submit KYC or provides a 10-digit phone number AND is not yet verified.
+    4. UNDERWRITING: If the user has agreed to evaluating a new loan amount OR agreed to an offer OR uploaded a document, route to UNDERWRITING.
 
     Respond with EXACTLY ONE WORD: SALES or VERIFICATION or UNDERWRITING.
     """
@@ -726,6 +772,12 @@ async def tts_endpoint(req: TTSRequest):
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
     current_state = req.state
+    if current_state and current_state.get("is_closed"):
+        return {
+            "response": "The chat is closed. For any further query contact our office.",
+            "state": current_state
+        }
+        
     if not current_state:
         current_state = {
             "response": "",
@@ -736,7 +788,8 @@ async def chat_endpoint(req: ChatRequest):
             "expected_otp": "",
             "otp_verified": False,
             "session_id": "",
-            "memory_context": ""
+            "memory_context": "",
+            "is_closed": False
         }
     
     session_id = req.session_id or current_state.get("session_id") or str(uuid.uuid4())
@@ -748,6 +801,15 @@ async def chat_endpoint(req: ChatRequest):
     # Invoke with thread_id for MemorySaver checkpointing
     config = {"configurable": {"thread_id": session_id}}
     result = graph_app.invoke(current_state, config=config)
+    
+    # Ensure current turn is recorded if not done by the node
+    chat_history = result.get("chat_history", [])
+    if not chat_history or chat_history[-1].get("content") != result["response"]:
+        new_history = chat_history.copy()
+        if req.user_input:
+            new_history.append({"role": "user", "content": req.user_input})
+        new_history.append({"role": "assistant", "content": result["response"]})
+        result["chat_history"] = new_history
     
     return {
         "response": result["response"],
