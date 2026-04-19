@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from fpdf import FPDF
 from twilio.rest import Client as TwilioClient
 from memory import init_memory_db, get_conversation_summary, save_conversation_summary, delete_conversation_memory, summarize_conversation
+from langsmith import traceable
 
 # ---------------------------------------------------------
 # 1. API Configuration & LLM Setup
@@ -25,6 +26,12 @@ load_dotenv(find_dotenv())
 API_KEY = os.getenv('groq_api_key') or os.getenv('GROQ_API_KEY')
 client = Groq(api_key=API_KEY)
 model_name = "llama-3.3-70b-versatile"
+
+# Check and notify about LangSmith tracing
+if os.getenv("LANGCHAIN_TRACING_V2") == "true":
+    print(f"[Observability] LangSmith Tracing is ENABLED. Project: {os.getenv('LANGCHAIN_PROJECT', 'default')}")
+else:
+    print("[Observability] LangSmith Tracing is DISABLED.")
 
 # ---------------------------------------------------------
 # 2. State Definition & Database
@@ -107,6 +114,7 @@ def send_otp_sms(phone_number: str, otp: str) -> bool:
 # ---------------------------------------------------------
 # 3. Agent Functions
 # ---------------------------------------------------------
+@traceable(run_type="llm")
 def ask_gemini(system_prompt, user_input, chat_history):
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(chat_history)
@@ -149,7 +157,7 @@ def sales_agent(state: GraphState) -> GraphState:
     CONVERSATION GUIDELINES:
     1. RELEVANT QUESTIONS: If the user asks general questions about loans, interest rates, or banking, answer them openly and then gently guide the conversation back to collecting the missing checklist items.
     2. IRRELEVANT QUESTIONS: If the user asks about unrelated topics (e.g., cars, food, general chat), politely state that this is outside your expertise and steer them back to the loan application process.
-    3. STRICT COMPLIANCE RULE: You MUST validate the 'Purpose'. Acceptable purposes are: Business Expansion, Medical Emergency, Education, Home Renovation, or Vehicle Purchase. If the user states ANY other purpose (like food, daily expenses, gambling, etc.), you MUST politely inform them that NBFC policy does not permit lending for this purpose. DO NOT ask for any more checklist items! Reject the loan immediately.
+    3. STRICT COMPLIANCE RULE: You MUST validate the 'Purpose'. Acceptable purposes are: Business Expansion, Medical Emergency, Education, Home Renovation, or Vehicle Purchase. If the user states ANY other purpose (like food, daily expenses, gambling, etc.), you MUST politely inform them that NBFC policy does not permit lending for this purpose. DO NOT ask for any more checklist items! Reject the loan immediately and state: "This application is closed." Do NOT ask the user if they need help with anything else. Do NOT continue the conversation.
     4. CRITICAL: Never repeat questions. Acknowledge user input and ask ONLY for the missing items. Keep answers precise.
 
     {handoff_rule} """
@@ -269,6 +277,7 @@ def generate_sanction_letter(user_data: dict, loan_amount: int, phone: str) -> s
 
     return f"/static/sanction_letters/{filename}"
 
+@traceable(run_type="llm")
 def verify_salary_slip(base64_img: str) -> int:
     prompt = "Analyze this salary slip image. Extract the monthly net or gross salary. Only output the numeric value of the monthly salary without any formatting. If no salary is found, output 0."
     try:
@@ -567,6 +576,7 @@ def underwriting_agent(state: GraphState) -> GraphState:
 
 
 
+@traceable(run_type="llm")
 def master_router(state: GraphState) -> Literal["sales_node", "verification_node", "underwriting_node", "exit"]:
     user_text = state.get("user_input", "").strip()
 
