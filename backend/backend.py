@@ -403,6 +403,36 @@ def underwriting_agent(state: GraphState) -> GraphState:
                 "is_closed": True
             }
 
+    # Handle user accepting a conditional approval offer
+    positive_affirmations = ["yes", "proceed", "ok", "sure", "yeah", "yep", "do it", "accept"]
+    if "Conditional Approval" in last_response and any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in positive_affirmations):
+        # Extract the reduced amount from the previous conditional approval response
+        reduced_match = re.search(r'₹([\d,]+)', last_response)
+        if reduced_match:
+            accepted_amount = int(reduced_match.group(1).replace(',', ''))
+        else:
+            # Fallback: use 75% of extracted loan amount
+            accepted_amount = int(extract_loan_amount(state.get("chat_history", [])) * 0.75)
+
+        phone_number = user_data.get("phone", "Unknown")
+        accepted_emi = calculate_emi(accepted_amount)
+        base_url = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("BASE_URL", "http://localhost:8000"))
+        pdf_url = generate_sanction_letter(user_data, accepted_amount, phone_number)
+        download_link = f"{base_url}{pdf_url}"
+
+        return {
+            **state,
+            "response": (
+                f"✅ **Loan Approved!**\n\n"
+                f"Approved Amount: ₹{accepted_amount:,}\n"
+                f"EMI: ₹{accepted_emi:,.2f}/month\n\n"
+                f"Download your sanction letter: {download_link}\n\n"
+                f"For any further query contact our office."
+            ),
+            "active_agent": "underwriting",
+            "is_closed": True
+        }
+
     # Handle negative response to conditional approval or document requests
     negative_affirmations = ["no", "nope", "cancel", "decline", "reject", "don't", "not"]
     if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in negative_affirmations):
