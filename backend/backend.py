@@ -433,15 +433,35 @@ def underwriting_agent(state: GraphState) -> GraphState:
             "is_closed": True
         }
 
-    # Handle negative response to conditional approval or document requests
-    negative_affirmations = ["no", "nope", "cancel", "decline", "reject", "don't", "not"]
-    if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in negative_affirmations):
-        return {
-            **state,
-            "response": "You have declined the offer or cancelled the process. Your application has been closed. For any further query contact our office.",
-            "active_agent": "master",
-            "is_closed": True
-        }
+    # Handle renegotiation: user provides a NEW loan amount instead of accepting/declining
+    # Check if the user's current input contains a new loan amount (e.g., "do 14 lakhs")
+    if "Conditional Approval" in last_response:
+        renegotiated_amount = extract_loan_amount_regex([{"role": "user", "content": state.get("user_input", "")}])
+        if renegotiated_amount > 0:
+            # User is renegotiating with a new amount — update and fall through to re-evaluate
+            user_data["loan_amount"] = renegotiated_amount
+            print(f"[Renegotiation] User proposed new amount: {renegotiated_amount}")
+            # Fall through to the risk assessment logic below (skip the negative check)
+        else:
+            # No new amount found — check for decline
+            negative_affirmations = ["no", "nope", "cancel", "decline", "reject", "don't", "not"]
+            if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in negative_affirmations):
+                return {
+                    **state,
+                    "response": "You have declined the offer or cancelled the process. Your application has been closed. For any further query contact our office.",
+                    "active_agent": "master",
+                    "is_closed": True
+                }
+    else:
+        # Handle negative response outside of conditional approval context
+        negative_affirmations = ["no", "nope", "cancel", "decline", "reject", "don't", "not"]
+        if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in negative_affirmations):
+            return {
+                **state,
+                "response": "You have declined the offer or cancelled the process. Your application has been closed. For any further query contact our office.",
+                "active_agent": "master",
+                "is_closed": True
+            }
 
     phone_number = user_data.get("phone", "Unknown")
     credit_score = user_data.get("credit_score", 0)
@@ -450,8 +470,14 @@ def underwriting_agent(state: GraphState) -> GraphState:
 
     # Extract loan amount
     # ALWAYS extract to capture the latest requested amount if a user negotiated it
-    if state.get("chat_history"):
-        new_amount = extract_loan_amount(state.get("chat_history"))
+    # Include the current user_input so the newest message is always considered
+    extraction_history = list(state.get("chat_history", []))
+    current_input = state.get("user_input", "")
+    if current_input:
+        extraction_history.append({"role": "user", "content": current_input})
+
+    if extraction_history:
+        new_amount = extract_loan_amount(extraction_history)
         if new_amount > 0:
             user_data["loan_amount"] = new_amount
 
@@ -624,6 +650,10 @@ def master_router(state: GraphState) -> Literal["sales_node", "verification_node
             gratitude_words = ["thanks", "thank you", "awesome", "great", "cool", "nice", "bye", "ok", "okay"]
             if any(re.search(rf"\b{re.escape(word)}\b", user_text_lower) for word in gratitude_words) or len(user_text.split()) <= 4:
                 return "underwriting_node"
+        # During Conditional Approval, ALL responses go to underwriting
+        # (renegotiation with new amount, acceptance, or decline are all handled there)
+        if "Conditional Approval" in last_response:
+            return "underwriting_node"
 
     if state.get("otp_verified"):
         user_text_lower = user_text.lower()
